@@ -256,6 +256,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
         // is the source of truth for jobKey (must use big-endian minerId path).
         public byte[] InstalledSigma = [];       // 128 B; empty == no σ installed
         public byte[] InstalledJobKey = [];      // 32 B; matches InstalledSigma
+        public string? InstalledExternalJobId;       // Stratum job id; null for Akoya V2
         public byte[] InstalledHashB = [];       // 32 B; keyed-merkle root of bBytes under InstalledJobKey
         public byte[] InstalledBSeed = [];       // 32 B; pool-supplied opaque B seed for the current σ
         public uint   InstalledAuditK;           // audit_proof v1 K parameter (0 = disabled)
@@ -265,7 +266,8 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
         // in-flight ShareFinalizer payload holds its own Acquired reference.
         public IMerkleTreeHandle? BMerkleTree;
         public Task<IMerkleTreeHandle>? BMerkleTreeBuildTask;
-        public uint   InstalledTargetNbits;      // pool difficulty nbits we built dPowTarget against
+        public uint   InstalledTargetNbits;      // Akoya V2 compact target; 0 for full-target Stratum jobs
+        public BigInteger InstalledEffectiveTarget = BigInteger.Zero; // exact pool target used to build dPowTarget
         public ulong  SigmaSeed;                 // BitConverter.ToUInt64(σ[0..8]) — drives lcg_int7
 
         // Stats window.
@@ -1040,9 +1042,15 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
 
         half.GraphReady = false;
 
-        var diffTarget = SigmaContext.NbitsToTarget(ctx.TargetNbits);
-        var adjusted   = diffTarget * s.MiningConfig.DifficultyAdjustmentFactor();
-        if (adjusted >= BigInteger.One << 256) adjusted = (BigInteger.One << 256) - 1;
+        // Unified target path:
+        //   Akoya V2   -> ctx.EffectiveTarget derives from TargetNbits
+        //   Stratum    -> ctx.EffectiveTarget is the exact 256-bit pool target
+        // In both cases Pearl scales the pool target by the mining-config
+        // difficulty-adjustment factor before uploading it to dPowTarget.
+        var diffTarget = ctx.EffectiveTarget;
+        var adjusted = diffTarget * s.MiningConfig.DifficultyAdjustmentFactor();
+        var maxTarget = TargetSpace - BigInteger.One;
+        if (adjusted > maxTarget) adjusted = maxTarget;
         H2D(b.PowTarget, TargetToUint32LE(adjusted));
 
         if (half.Workspace == IntPtr.Zero)
@@ -1112,38 +1120,58 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
     private SigmaRotationTimingBuilder InstallSigma(WorkerState s, SigmaContext ctx, double oldBatchDrainMs)
     {
         var timing = new SigmaRotationTimingBuilder { OldBatchDrainMs = oldBatchDrainMs };
+
         bool sameAsInstalled = s.InstalledSigma.Length > 0
             && s.InstalledSigma.AsSpan().SequenceEqual(ctx.Sigma.AsSpan());
 
-        if (sameAsInstalled && s.InstalledTargetNbits == ctx.TargetNbits)
+        var effectiveTarget = ctx.EffectiveTarget;
+        bool sameTarget = s.InstalledEffectiveTarget == effectiveTarget;
+
+        if (sameAsInstalled && sameTarget)
         {
             return timing;
         }
 
-        // Vardiff fast path: same σ, different target — update PowTarget on both halves.
-        // Caller guarantees both streams are idle (Ping was drained, Pong was never queued).
-        if (sameAsInstalled && s.InstalledTargetNbits != ctx.TargetNbits)
+        // Vardiff fast path: same Pearl header/sigma, different pool target.
+        // Works for both Akoya's compact NBits and an exact Stratum target.
+        if (sameAsInstalled && !sameTarget)
         {
             _log.LogInformation(
-                "worker[{Gpu}]: vardiff retarget {Old:X8} → {New:X8} (same σ)",
-                _gpuIndex, s.InstalledTargetNbits, ctx.TargetNbits);
-            var diffTargetVd = SigmaContext.NbitsToTarget(ctx.TargetNbits);
-            var adjustedVd   = diffTargetVd * s.MiningConfig.DifficultyAdjustmentFactor();
-            if (adjustedVd >= BigInteger.One << 256) adjustedVd = (BigInteger.One << 256) - 1;
+                "worker[{Gpu}]: vardiff retarget (same σ) oldTargetBits={OldBits} newTargetBits={NewBits}",
+                _gpuIndex,
+                GetBitLength(s.InstalledEffectiveTarget),
+                GetBitLength(effectiveTarget));
+
+            var adjustedVd = effectiveTarget * s.MiningConfig.DifficultyAdjustmentFactor();
+            var maxTarget = TargetSpace - BigInteger.One;
+            if (adjustedVd > maxTarget) adjustedVd = maxTarget;
+
             var targetBytes = TargetToUint32LE(adjustedVd);
             long vardiffStart = Stopwatch.GetTimestamp();
             H2D(s.Ping.Buffers.PowTarget, targetBytes);
             H2D(s.Pong.Buffers.PowTarget, targetBytes);
             timing.InstallGpuMs = ElapsedMsSince(vardiffStart);
+
+            // Keep both forms because Akoya V2 share construction still needs
+            // the original compact field, while Stratum uses EffectiveTarget.
             s.InstalledTargetNbits = ctx.TargetNbits;
+            s.InstalledEffectiveTarget = effectiveTarget;
+            s.InstalledExternalJobId = ctx.ExternalJobId;
+
             TouchProgress();
             TouchTriggerOrSigma();
             return timing;
         }
 
         _log.LogInformation(
-            "worker[{Gpu}]: σ install job={Job} height={H} nbits=0x{Nbits:X8} (rotate={Rot}) sigma={SigmaPrefix} jobKey={JobKeyPrefix} bSeed={BSeedPrefix} auditK={AuditK}",
-            _gpuIndex, ctx.JobId, ctx.BlockHeight, ctx.TargetNbits, !sameAsInstalled,
+            "worker[{Gpu}]: σ install job={Job} externalJob={ExternalJob} height={H} targetBits={TargetBits} nbits=0x{Nbits:X8} (rotate={Rot}) sigma={SigmaPrefix} jobKey={JobKeyPrefix} bSeed={BSeedPrefix} auditK={AuditK}",
+            _gpuIndex,
+            ctx.JobId,
+            ctx.ExternalJobId ?? "-",
+            ctx.BlockHeight,
+            GetBitLength(effectiveTarget),
+            ctx.TargetNbits,
+            !sameAsInstalled,
             Convert.ToHexString(ctx.Sigma.AsSpan(0, Math.Min(8, ctx.Sigma.Length))),
             Convert.ToHexString(ctx.JobKey.AsSpan(0, Math.Min(8, ctx.JobKey.Length))),
             Convert.ToHexString(ctx.BSeed.AsSpan(0, Math.Min(8, ctx.BSeed.Length))),
@@ -1186,10 +1214,12 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
         PrepareGraphIfEnabled(s.Pong, _mine.CudaGraphIter, _mine.CudaGraphRequired, _log, "pong");
         timing.GraphPrepareMs = ElapsedMsSince(graphStart);
 
-        s.InstalledSigma       = (byte[])ctx.Sigma.Clone();
-        s.InstalledJobKey      = (byte[])ctx.JobKey.Clone();
-        s.InstalledAuditK      = ctx.AuditK;
+        s.InstalledSigma = (byte[])ctx.Sigma.Clone();
+        s.InstalledJobKey = (byte[])ctx.JobKey.Clone();
+        s.InstalledAuditK = ctx.AuditK;
         s.InstalledTargetNbits = ctx.TargetNbits;
+        s.InstalledEffectiveTarget = effectiveTarget;
+        s.InstalledExternalJobId = ctx.ExternalJobId;
         s.SigmaInstalledAtTimestamp = Stopwatch.GetTimestamp();
 
         TouchProgress();
@@ -1359,6 +1389,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             Sigma:                  (byte[])s.InstalledSigma.Clone(),
             ConfigBytes:            s.MiningConfig.ToBytes(),
             JobKey:                 (byte[])s.InstalledJobKey.Clone(),
+            ExternalJobId:           s.InstalledExternalJobId,
             ABytes:                 aBytes,
             ASlice:                 aSlice,
             ALeafCvs:               aLeafCvs,
@@ -1383,6 +1414,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             K:                      b.K,
             R:                      b.R,
             ClaimedDifficultyNbits: s.InstalledTargetNbits,
+            EffectiveTarget:         s.InstalledEffectiveTarget,
             MiningConfig:           s.MiningConfig,
             MsTotalSoFar:           RuntimeTimingElapsedMs(totalStart),
             MsDrainWait:            msDrainWait,
@@ -1410,7 +1442,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
         double tmadsPerSec= (madsPerIter * dIters / dWall) / 1e12;
         double hashesPerSec = tilesPerSec * s.MiningConfig.DifficultyAdjustmentFactor();
         double expectedOpensPerSec = ExpectedOpensPerSecond(
-            tilesPerSec, s.InstalledTargetNbits, s.MiningConfig);
+            tilesPerSec, s.InstalledEffectiveTarget, s.MiningConfig);
         double iterMs     = dWall * 1000.0 / dIters;
         Volatile.Write(ref _lastIterMsBits, BitConverter.DoubleToInt64Bits(iterMs));
 
@@ -2242,22 +2274,38 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
         return ((long)m / patternH) * ((long)n / patternW);
     }
 
+    // Backward-compatible Akoya V2 overload used by existing tests/callers.
     internal static double ExpectedOpensPerSecond(
         double tilesPerSec,
         uint targetNbits,
         MiningConfiguration miningConfig)
+        => ExpectedOpensPerSecond(
+            tilesPerSec,
+            SigmaContext.NbitsToTarget(targetNbits),
+            miningConfig);
+
+    // Unified full-target overload used by the live worker.
+    internal static double ExpectedOpensPerSecond(
+        double tilesPerSec,
+        BigInteger poolTarget,
+        MiningConfiguration miningConfig)
     {
         if (!double.IsFinite(tilesPerSec) || tilesPerSec <= 0.0)
             return 0.0;
-
-        var adjustedTarget = SigmaContext.NbitsToTarget(targetNbits)
-                             * miningConfig.DifficultyAdjustmentFactor();
-        if (adjustedTarget <= BigInteger.Zero)
+        if (poolTarget <= BigInteger.Zero)
             return 0.0;
+
+        var adjustedTarget = poolTarget * miningConfig.DifficultyAdjustmentFactor();
         if (adjustedTarget >= TargetSpace)
             return tilesPerSec;
 
         return tilesPerSec * ((double)adjustedTarget / TargetSpaceAsDouble);
+    }
+
+    private static long GetBitLength(BigInteger value)
+    {
+        if (value <= BigInteger.Zero) return 0;
+        return value.GetBitLength();
     }
 
     private static void ValidateCtaTileDivisibility(int m, int n)

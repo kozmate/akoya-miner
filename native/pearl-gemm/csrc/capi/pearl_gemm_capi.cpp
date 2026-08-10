@@ -11,7 +11,10 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -69,6 +72,48 @@ int transcript_launch_rc(cudaError_t err) {
 
 int transcript_finalize_rc(cudaError_t err) {
   return err == cudaSuccess ? 0 : -35000 - static_cast<int>(err);
+}
+
+// One-shot native hot-path profiler. Set PEARL_GEMM_PROFILE_ITER=N to profile
+// the Nth pearl_capi_iter() call in this process. Normal mining has zero CUDA
+// event/synchronization overhead when the variable is unset.
+std::atomic<uint64_t> g_profile_iter_call_count{0};
+thread_local bool g_profile_noisy_detail_active = false;
+
+uint64_t profile_iter_target() {
+  static const uint64_t target = []() -> uint64_t {
+    const char* env = std::getenv("PEARL_GEMM_PROFILE_ITER");
+    if (!env || !*env) return 0;
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(env, &end, 10);
+    if (end == env || (end && *end != '\0') || v == 0) return 0;
+    return static_cast<uint64_t>(v);
+  }();
+  return target;
+}
+
+bool create_timing_events(cudaEvent_t* events, int count) {
+  for (int i = 0; i < count; ++i) {
+    events[i] = nullptr;
+    if (cudaEventCreate(&events[i]) != cudaSuccess) {
+      for (int j = 0; j < i; ++j) cudaEventDestroy(events[j]);
+      for (int j = 0; j < count; ++j) events[j] = nullptr;
+      return false;
+    }
+  }
+  return true;
+}
+
+void destroy_timing_events(cudaEvent_t* events, int count) {
+  for (int i = 0; i < count; ++i) {
+    if (events[i]) cudaEventDestroy(events[i]);
+  }
+}
+
+float elapsed_event_ms(cudaEvent_t start, cudaEvent_t stop) {
+  float ms = 0.0f;
+  if (start && stop) (void)cudaEventElapsedTime(&ms, start, stop);
+  return ms;
 }
 
 }  // namespace
@@ -736,6 +781,13 @@ PEARL_CAPI_EXPORT int pearl_capi_noisy_gemm(const PearlCapiNoisyGemmParams* p,
   try {
     cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
 #ifdef PEARL_GEMM_PORTABLE
+    // When the enclosing pearl_capi_iter() is the selected profile sample,
+    // split NoisyGemm into its three dominant GPU segments as well.
+    const bool profile_noisy = g_profile_noisy_detail_active;
+    cudaEvent_t noisy_ev[4]{};
+    const bool noisy_events_ok =
+        profile_noisy && create_timing_events(noisy_ev, 4);
+    if (noisy_events_ok) (void)cudaEventRecord(noisy_ev[0], stream);
     // Portable path — torch-free mirror of noisy_gemm_portable_impl in
     // csrc/gemm/pearl_gemm_api.cpp, compatible with sm_80/86/120a.
     //
@@ -772,6 +824,7 @@ PEARL_CAPI_EXPORT int pearl_capi_noisy_gemm(const PearlCapiNoisyGemmParams* p,
         static_cast<const int8_t*>(p->A),
         static_cast<const int8_t*>(p->EBL_K_major),
         p->AxEBL_fp16, noiseA_scratch, m, r, k, /*divisor_log2*/14, stream);
+    if (noisy_events_ok && rc == 0) (void)cudaEventRecord(noisy_ev[1], stream);
     if (rc == 0) {
       rc = int8_add_clamp_to_int8(
           static_cast<const int8_t*>(p->A),
@@ -781,7 +834,11 @@ PEARL_CAPI_EXPORT int pearl_capi_noisy_gemm(const PearlCapiNoisyGemmParams* p,
           noiseA_scratch, m, k, r, stream);
     }
     if (na_owned) cudaFreeAsync(noiseA_scratch, stream);
-    if (rc != 0) return rc;
+    if (noisy_events_ok && rc == 0) (void)cudaEventRecord(noisy_ev[2], stream);
+    if (rc != 0) {
+      if (noisy_events_ok) destroy_timing_events(noisy_ev, 4);
+      return rc;
+    }
 
     // ── Step 2: transcript_gemm + target check ──────────────────────────
     // Pure-miner path: skip_c_store=true always, so no C buffer is ever
@@ -840,7 +897,27 @@ PEARL_CAPI_EXPORT int pearl_capi_noisy_gemm(const PearlCapiNoisyGemmParams* p,
         static_cast<HostSignalSync*>(p->host_signal_sync),
         static_cast<HostSignalHeader*>(p->host_signal_header_pinned),
         stream);
-    if (launch_err != cudaSuccess) return transcript_launch_rc(launch_err);
+    if (launch_err != cudaSuccess) {
+      if (noisy_events_ok) destroy_timing_events(noisy_ev, 4);
+      return transcript_launch_rc(launch_err);
+    }
+
+    if (noisy_events_ok) {
+      (void)cudaEventRecord(noisy_ev[3], stream);
+      if (cudaEventSynchronize(noisy_ev[3]) == cudaSuccess) {
+        const float axebl_ms = elapsed_event_ms(noisy_ev[0], noisy_ev[1]);
+        const float apea_ms = elapsed_event_ms(noisy_ev[1], noisy_ev[2]);
+        const float transcript_ms = elapsed_event_ms(noisy_ev[2], noisy_ev[3]);
+        std::fprintf(stderr,
+            "PEARL NATIVE PROFILE NOISY: AxEBL=%.3fms ApEA=%.3fms "
+            "transcript_gemm=%.3fms total=%.3fms scratch=%s\n",
+            axebl_ms, apea_ms, transcript_ms,
+            elapsed_event_ms(noisy_ev[0], noisy_ev[3]),
+            na_owned ? "temporary" : "workspace");
+        std::fflush(stderr);
+      }
+      destroy_timing_events(noisy_ev, 4);
+    }
 
     (void)p->C; (void)p->A_scales; (void)p->B_scales;
     (void)p->EBR; (void)p->EBR_fp16; (void)p->EARxBpEB_fp16;
@@ -1103,12 +1180,29 @@ PEARL_CAPI_EXPORT int pearl_capi_iter(void*    workspace_ptr,
 
   const PearlCapiWorkspaceParams& p = ws->params;
   const int device_id = ws->device_id;
+  cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
   int rc;
+
+  const uint64_t profile_target = profile_iter_target();
+  const uint64_t profile_call = profile_target != 0
+      ? g_profile_iter_call_count.fetch_add(1, std::memory_order_relaxed) + 1
+      : 0;
+  const bool profile_this = profile_target != 0 && profile_call == profile_target;
+  cudaEvent_t ev[6]{};
+  const bool events_ok = profile_this && create_timing_events(ev, 6);
+  if (events_ok) (void)cudaEventRecord(ev[0], stream);
+
+  auto fail = [&](int code) -> int {
+    g_profile_noisy_detail_active = false;
+    if (events_ok) destroy_timing_events(ev, 6);
+    return code;
+  };
 
   // 1. Fill A with deterministic int7 values for this nonce.
   rc = pearl_capi_lcg_int7_fill(p.A, (int64_t)p.m * p.k,
                                  seed_lo, p.sigma_seed, stream_void);
-  if (rc != 0) return rc;
+  if (rc != 0) return fail(rc);
+  if (events_ok) (void)cudaEventRecord(ev[1], stream);
 
   // 2. Hash A → AHash (Merkle tree root).
   rc = pearl_capi_tensor_hash(
@@ -1118,7 +1212,8 @@ PEARL_CAPI_EXPORT int pearl_capi_iter(void*    workspace_ptr,
       static_cast<const uint8_t*>(p.Key),
       p.th_num_blocks, p.th_threads, p.th_stages, p.th_leaves,
       static_cast<uint8_t*>(p.Roots), device_id, stream_void);
-  if (rc != 0) return rc;
+  if (rc != 0) return fail(rc);
+  if (events_ok) (void)cudaEventRecord(ev[2], stream);
 
   // 3. Commitment hash: (AHash, BHash) → CommitA, CommitB.
   rc = pearl_capi_commitment_hash_from_merkle_roots(
@@ -1128,7 +1223,8 @@ PEARL_CAPI_EXPORT int pearl_capi_iter(void*    workspace_ptr,
       static_cast<uint8_t*>(p.CommitA),
       static_cast<uint8_t*>(p.CommitB),
       device_id, stream_void);
-  if (rc != 0) return rc;
+  if (rc != 0) return fail(rc);
+  if (events_ok) (void)cudaEventRecord(ev[3], stream);
 
   // 4. Noise-gen A only (B-side computed once at σ-install).
   rc = pearl_capi_noise_gen(
@@ -1137,12 +1233,44 @@ PEARL_CAPI_EXPORT int pearl_capi_iter(void*    workspace_ptr,
       p.EAR_R_major, p.EAR_K_major,
       nullptr, nullptr, nullptr, nullptr,
       static_cast<const uint8_t*>(p.CommitA), nullptr, stream_void);
-  if (rc != 0) return rc;
+  if (rc != 0) return fail(rc);
+  if (events_ok) (void)cudaEventRecord(ev[4], stream);
 
   // 5. Noisy GEMM — copy template and patch only the per-iter header pointer.
   PearlCapiNoisyGemmParams ng = ws->ng_template;
   ng.host_signal_header_pinned = host_signal_header_pinned;
-  return pearl_capi_noisy_gemm(&ng, stream_void);
+  g_profile_noisy_detail_active = events_ok;
+  rc = pearl_capi_noisy_gemm(&ng, stream_void);
+  g_profile_noisy_detail_active = false;
+  if (rc != 0) return fail(rc);
+  if (events_ok) (void)cudaEventRecord(ev[5], stream);
+
+  if (events_ok) {
+    if (cudaEventSynchronize(ev[5]) == cudaSuccess) {
+      const float lcg_ms = elapsed_event_ms(ev[0], ev[1]);
+      const float tensor_hash_ms = elapsed_event_ms(ev[1], ev[2]);
+      const float commit_ms = elapsed_event_ms(ev[2], ev[3]);
+      const float noise_gen_ms = elapsed_event_ms(ev[3], ev[4]);
+      const float noisy_gemm_ms = elapsed_event_ms(ev[4], ev[5]);
+      const float total_ms = elapsed_event_ms(ev[0], ev[5]);
+      std::fprintf(stderr,
+          "PEARL NATIVE PROFILE ITER call=%llu seed=%llu: "
+          "LCG=%.3fms TensorHash=%.3fms CommitHash=%.3fms "
+          "NoiseGenA=%.3fms NoisyGemm=%.3fms Total=%.3fms\n",
+          static_cast<unsigned long long>(profile_call),
+          static_cast<unsigned long long>(seed_lo),
+          lcg_ms, tensor_hash_ms, commit_ms, noise_gen_ms, noisy_gemm_ms, total_ms);
+      std::fflush(stderr);
+    } else {
+      std::fprintf(stderr,
+          "PEARL NATIVE PROFILE ITER call=%llu: cudaEventSynchronize failed\n",
+          static_cast<unsigned long long>(profile_call));
+      std::fflush(stderr);
+    }
+    destroy_timing_events(ev, 6);
+  }
+
+  return 0;
 }
 
 // Batched variant of pearl_capi_iter(). Keeps kernel sequencing identical to

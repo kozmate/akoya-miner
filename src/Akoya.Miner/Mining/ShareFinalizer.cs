@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Numerics;
 using System.Threading.Channels;
 using Akoya.Mining;
 using Akoya.Miner.Observability;
@@ -24,6 +25,7 @@ internal sealed record SharePayload(
     byte[]          Sigma,
     byte[]          ConfigBytes,
     byte[]          JobKey,
+    string?         ExternalJobId,
     byte[]?         ABytes,
     byte[]?         ASlice,
     byte[]?         ALeafCvs,
@@ -40,11 +42,23 @@ internal sealed record SharePayload(
     int             K,
     int             R,
     uint            ClaimedDifficultyNbits,
+    BigInteger      EffectiveTarget,
     Akoya.Crypto.MiningConfiguration MiningConfig,
     double          MsTotalSoFar,
     double          MsDrainWait,
     double          MsLcgKernel,
     double          MsD2H);
+
+
+internal interface IPlainProofSink : IShareSink
+{
+    ValueTask SubmitPlainProofAsync(
+        string externalJobId,
+        string plainProofBase64,
+        int plainProofBytes,
+        ShareSubmission share,
+        CancellationToken ct);
+}
 
 internal sealed class ShareFinalizer : IAsyncDisposable
 {
@@ -180,8 +194,12 @@ internal sealed class ShareFinalizer : IAsyncDisposable
             try { p.BMerkleTree.Release(); } catch { /* best-effort */ }
         }
 
+        // Re-check against the exact pool target snapshot that was installed
+        // on the GPU when this candidate was found. For Akoya V2 this is the
+        // target decoded from ClaimedDifficultyNbits; for Stratum it is the
+        // full 256-bit target supplied by the pool.
         if (!ShareTargetGuard.ClearsLiveTarget(
-                share.ClaimedHash.Span, p.ClaimedDifficultyNbits, p.MiningConfig))
+                share.ClaimedHash.Span, p.EffectiveTarget, p.MiningConfig))
         {
             // Diagnostic surfacing: the docstring on ShareTargetGuard once
             // explained this skip as a "vardiff race tightened the target",
@@ -196,14 +214,58 @@ internal sealed class ShareFinalizer : IAsyncDisposable
             string jobKeyHex = Convert.ToHexString(
                 p.JobKey.AsSpan(0, Math.Min(8, p.JobKey.Length)));
             _log.LogWarning(
-                "worker[{Gpu}]: share skipped — claimedHash > liveTarget (nbits=0x{Nbits:X8} DAF={Daf} claimedHash[0..8]={Claimed} sigma[0..8]={Sigma} jobKey[0..8]={Job} tile=({Tr},{Tc}))",
-                p.GpuIndex, p.ClaimedDifficultyNbits, p.MiningConfig.DifficultyAdjustmentFactor(),
+                "worker[{Gpu}]: share skipped — claimedHash > installedTarget (targetBits={TargetBits} nbits=0x{Nbits:X8} DAF={Daf} claimedHash[0..8]={Claimed} sigma[0..8]={Sigma} jobKey[0..8]={Job} tile=({Tr},{Tc}))",
+                p.GpuIndex,
+                p.EffectiveTarget > BigInteger.Zero ? p.EffectiveTarget.GetBitLength() : 0,
+                p.ClaimedDifficultyNbits,
+                p.MiningConfig.DifficultyAdjustmentFactor(),
                 claimedHex, sigmaHex, jobKeyHex, p.TileRow, p.TileCol);
             return;
         }
 
         long queueStart = TimingStart();
-        _sink.SubmitAsync(share, _cts.Token).AsTask().GetAwaiter().GetResult();
+
+        if (!string.IsNullOrWhiteSpace(p.ExternalJobId))
+        {
+            if (_sink is not IPlainProofSink plainProofSink)
+            {
+                throw new InvalidOperationException(
+                    "Stratum share reached a sink that does not support PlainProof; refusing protobuf fallback.");
+            }
+
+            var encoded = PearlPlainProofCodec.EncodeDenseAndValidate(
+                share,
+                p.JobKey,
+                p.ARowIndices,
+                p.BColIndices,
+                p.M,
+                p.N,
+                p.K,
+                p.R);
+
+            _log.LogInformation(
+                "worker[{Gpu}]: LuckyPool PlainProof local validation OK job={Job} bytes={Bytes} base64Chars={Chars} hash={Hash}",
+                p.GpuIndex,
+                p.ExternalJobId,
+                encoded.ByteLength,
+                encoded.Base64.Length,
+                Convert.ToHexString(share.ClaimedHash.Span.Slice(0, Math.Min(8, share.ClaimedHash.Length))));
+
+            plainProofSink.SubmitPlainProofAsync(
+                    p.ExternalJobId!,
+                    encoded.Base64,
+                    encoded.ByteLength,
+                    share,
+                    _cts.Token)
+                .AsTask()
+                .GetAwaiter()
+                .GetResult();
+        }
+        else
+        {
+            _sink.SubmitAsync(share, _cts.Token).AsTask().GetAwaiter().GetResult();
+        }
+
         double msQueueWait = TimingElapsedMs(queueStart);
 
         // NOTE: Metrics.IncShareAccepted is NOT called here despite the

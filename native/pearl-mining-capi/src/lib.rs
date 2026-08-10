@@ -1546,3 +1546,313 @@ pub unsafe extern "C" fn pearl_capi_merkle_tree_free(handle: *mut std::ffi::c_vo
     }
     let _ = Box::from_raw(handle as *mut MerkleTreeCtx);
 }
+
+// ============================================================================
+// Dense Pearl PlainProof encoder / local validator for Stratum miners
+// ============================================================================
+//
+// The current Pearl PlainProof wire format is bincode 1.3's default helper
+// format (little-endian, fixed-width integers). We intentionally encode the
+// dense layout directly here instead of adding zk-pow (and its proving-system
+// dependency graph) to this small CAPI crate.
+//
+// Dense PlainProof field order:
+//   m, n, k, noise_rank, a: MatrixMerkleProof, bt: MatrixMerkleProof,
+//   moe: Option<MoEProofParams> = None.
+//
+// MerkleProof's `leaf_data` uses pearl-blake3's serde_chunk_vec helper, which
+// serializes it as Vec<&[u8]>: an outer u64 length, then for every 1024-byte
+// leaf an inner u64 length (=1024), then the raw leaf bytes.
+
+fn bincode_push_u64(out: &mut Vec<u8>, value: usize) -> Result<(), String> {
+    let value = u64::try_from(value).map_err(|_| "usize does not fit u64".to_string())?;
+    out.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn bincode_encode_merkle_proof(out: &mut Vec<u8>, proof: &pearl_blake3::MerkleProof) -> Result<(), String> {
+    // leaf_data: Vec<[u8;1024]> with serde_chunk_vec => Vec<&[u8]>
+    bincode_push_u64(out, proof.leaf_data.len())?;
+    for leaf in &proof.leaf_data {
+        bincode_push_u64(out, leaf.len())?;
+        out.extend_from_slice(leaf);
+    }
+
+    // leaf_indices: Vec<usize>
+    bincode_push_u64(out, proof.leaf_indices.len())?;
+    for &idx in &proof.leaf_indices {
+        bincode_push_u64(out, idx)?;
+    }
+
+    // total_leaves: usize
+    bincode_push_u64(out, proof.total_leaves)?;
+
+    // root: [u8;32]
+    out.extend_from_slice(&proof.root);
+
+    // siblings: Vec<[u8;32]>
+    bincode_push_u64(out, proof.siblings.len())?;
+    for sibling in &proof.siblings {
+        out.extend_from_slice(sibling);
+    }
+
+    Ok(())
+}
+
+fn bincode_encode_matrix_merkle_proof(
+    out: &mut Vec<u8>,
+    proof: &pearl_blake3::MerkleProof,
+    row_indices: &[usize],
+) -> Result<(), String> {
+    bincode_encode_merkle_proof(out, proof)?;
+    bincode_push_u64(out, row_indices.len())?;
+    for &idx in row_indices {
+        bincode_push_u64(out, idx)?;
+    }
+    Ok(())
+}
+
+unsafe fn plain_proof_read_merkle(
+    leaf_data_ptr: *const u8,
+    leaf_count: usize,
+    leaf_indices_ptr: *const u32,
+    leaf_indices_len: usize,
+    total_leaves: usize,
+    root_ptr: *const u8,
+    siblings_ptr: *const u8,
+    sibling_count: usize,
+    label: &str,
+) -> Result<pearl_blake3::MerkleProof, String> {
+    if leaf_count == 0 {
+        return Err(format!("{label}: leaf_count must be > 0"));
+    }
+    if leaf_indices_len != leaf_count {
+        return Err(format!(
+            "{label}: leaf_indices_len ({leaf_indices_len}) != leaf_count ({leaf_count})"
+        ));
+    }
+    if total_leaves == 0 {
+        return Err(format!("{label}: total_leaves must be > 0"));
+    }
+    if leaf_data_ptr.is_null() || leaf_indices_ptr.is_null() || root_ptr.is_null() {
+        return Err(format!("{label}: required proof pointer was null"));
+    }
+    if sibling_count > 0 && siblings_ptr.is_null() {
+        return Err(format!("{label}: siblings_ptr null with non-zero sibling_count"));
+    }
+
+    let leaf_data = (0..leaf_count)
+        .map(|i| {
+            let mut chunk = [0u8; blake3::CHUNK_LEN];
+            std::ptr::copy_nonoverlapping(
+                leaf_data_ptr.add(i * blake3::CHUNK_LEN),
+                chunk.as_mut_ptr(),
+                blake3::CHUNK_LEN,
+            );
+            chunk
+        })
+        .collect::<Vec<_>>();
+
+    let leaf_indices = std::slice::from_raw_parts(leaf_indices_ptr, leaf_indices_len)
+        .iter()
+        .map(|&v| v as usize)
+        .collect::<Vec<_>>();
+
+    let mut root = [0u8; 32];
+    std::ptr::copy_nonoverlapping(root_ptr, root.as_mut_ptr(), 32);
+
+    let siblings = (0..sibling_count)
+        .map(|i| {
+            let mut digest = [0u8; 32];
+            std::ptr::copy_nonoverlapping(siblings_ptr.add(i * 32), digest.as_mut_ptr(), 32);
+            digest
+        })
+        .collect::<Vec<_>>();
+
+    let proof = pearl_blake3::MerkleProof {
+        leaf_data,
+        leaf_indices,
+        total_leaves,
+        root,
+        siblings,
+    };
+
+    proof.sanity_check().map_err(|e| format!("{label}: {e}"))?;
+    Ok(proof)
+}
+
+unsafe fn plain_proof_read_rows(
+    ptr: *const u32,
+    len: usize,
+    row_bound: usize,
+    label: &str,
+) -> Result<Vec<usize>, String> {
+    if len == 0 {
+        return Err(format!("{label}: row index list must be non-empty"));
+    }
+    if ptr.is_null() {
+        return Err(format!("{label}: row index pointer was null"));
+    }
+    let rows = std::slice::from_raw_parts(ptr, len)
+        .iter()
+        .map(|&v| v as usize)
+        .collect::<Vec<_>>();
+
+    if !rows.windows(2).all(|w| w[0] < w[1]) {
+        return Err(format!("{label}: row indices must be strictly increasing"));
+    }
+    if let Some(&bad) = rows.iter().find(|&&v| v >= row_bound) {
+        return Err(format!("{label}: row index {bad} >= row bound {row_bound}"));
+    }
+    Ok(rows)
+}
+
+/// Validate a dense A/B^T Merkle opening and encode the current Pearl
+/// `PlainProof` bincode payload.
+///
+/// This is intentionally a *local validation* boundary for the experimental
+/// LuckyPool path: if either proof does not reconstruct its committed root, or
+/// if the proof's leaf set does not correspond exactly to the supplied matrix
+/// rows/columns, no output is produced.
+///
+/// The returned bytes are the raw bincode blob. The caller may Base64-encode
+/// them for LuckyPool's `plain_proof` Stratum field. Caller MUST release the
+/// returned buffer with `pearl_capi_free_buffer(ptr, len)`.
+#[no_mangle]
+pub unsafe extern "C" fn pearl_capi_plain_proof_encode_dense(
+    m: usize,
+    n: usize,
+    k: usize,
+    noise_rank: usize,
+    key_ptr: *const u8,
+
+    a_leaf_data_ptr: *const u8,
+    a_leaf_count: usize,
+    a_leaf_indices_ptr: *const u32,
+    a_leaf_indices_len: usize,
+    a_row_indices_ptr: *const u32,
+    a_row_indices_len: usize,
+    a_total_leaves: usize,
+    a_root_ptr: *const u8,
+    a_siblings_ptr: *const u8,
+    a_sibling_count: usize,
+
+    b_leaf_data_ptr: *const u8,
+    b_leaf_count: usize,
+    b_leaf_indices_ptr: *const u32,
+    b_leaf_indices_len: usize,
+    b_row_indices_ptr: *const u32,
+    b_row_indices_len: usize,
+    b_total_leaves: usize,
+    b_root_ptr: *const u8,
+    b_siblings_ptr: *const u8,
+    b_sibling_count: usize,
+
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+    err_msg_ptr: *mut *mut c_char,
+) -> c_int {
+    if !out_bytes.is_null() { *out_bytes = std::ptr::null_mut(); }
+    if !out_len.is_null() { *out_len = 0; }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<u8>, String> {
+        if out_bytes.is_null() || out_len.is_null() {
+            return Err("plain_proof: output pointer was null".into());
+        }
+        if key_ptr.is_null() {
+            return Err("plain_proof: key_ptr was null".into());
+        }
+        if m == 0 || n == 0 || k == 0 || noise_rank == 0 {
+            return Err("plain_proof: m/n/k/noise_rank must all be > 0".into());
+        }
+
+        let mut key = [0u8; 32];
+        std::ptr::copy_nonoverlapping(key_ptr, key.as_mut_ptr(), 32);
+
+        let a_proof = plain_proof_read_merkle(
+            a_leaf_data_ptr,
+            a_leaf_count,
+            a_leaf_indices_ptr,
+            a_leaf_indices_len,
+            a_total_leaves,
+            a_root_ptr,
+            a_siblings_ptr,
+            a_sibling_count,
+            "A",
+        )?;
+        let b_proof = plain_proof_read_merkle(
+            b_leaf_data_ptr,
+            b_leaf_count,
+            b_leaf_indices_ptr,
+            b_leaf_indices_len,
+            b_total_leaves,
+            b_root_ptr,
+            b_siblings_ptr,
+            b_sibling_count,
+            "B^T",
+        )?;
+
+        let a_rows = plain_proof_read_rows(a_row_indices_ptr, a_row_indices_len, m, "A")?;
+        let b_rows = plain_proof_read_rows(b_row_indices_ptr, b_row_indices_len, n, "B^T")?;
+
+        let expected_a_leaves = MerkleTree::compute_leaf_indices_from_rows(&a_rows, (m, k));
+        if expected_a_leaves != a_proof.leaf_indices {
+            return Err(format!(
+                "A: leaf indices do not match row indices (expected {:?}, got {:?})",
+                expected_a_leaves, a_proof.leaf_indices
+            ));
+        }
+        let expected_b_leaves = MerkleTree::compute_leaf_indices_from_rows(&b_rows, (n, k));
+        if expected_b_leaves != b_proof.leaf_indices {
+            return Err(format!(
+                "B^T: leaf indices do not match row indices (expected {:?}, got {:?})",
+                expected_b_leaves, b_proof.leaf_indices
+            ));
+        }
+
+        match a_proof.compute_root(key) {
+            Some(root) if root == a_proof.root => {}
+            Some(_) => return Err("A: Merkle root mismatch".into()),
+            None => return Err("A: invalid Merkle proof structure".into()),
+        }
+        match b_proof.compute_root(key) {
+            Some(root) if root == b_proof.root => {}
+            Some(_) => return Err("B^T: Merkle root mismatch".into()),
+            None => return Err("B^T: invalid Merkle proof structure".into()),
+        }
+
+        let mut encoded = Vec::new();
+        bincode_push_u64(&mut encoded, m)?;
+        bincode_push_u64(&mut encoded, n)?;
+        bincode_push_u64(&mut encoded, k)?;
+        bincode_push_u64(&mut encoded, noise_rank)?;
+        bincode_encode_matrix_merkle_proof(&mut encoded, &a_proof, &a_rows)?;
+        bincode_encode_matrix_merkle_proof(&mut encoded, &b_proof, &b_rows)?;
+
+        // PlainProof.moe = None. Bincode serializes Option::None as one 0 byte.
+        encoded.push(0);
+        Ok(encoded)
+    }));
+
+    match result {
+        Ok(Ok(buf)) => {
+            let len = buf.len();
+            if len == 0 {
+                set_err(err_msg_ptr, "plain_proof: encoder produced empty output");
+                return PEARL_CAPI_ERR_INTERNAL;
+            }
+            let boxed = buf.into_boxed_slice();
+            *out_len = len;
+            *out_bytes = Box::into_raw(boxed) as *mut u8;
+            PEARL_CAPI_OK
+        }
+        Ok(Err(e)) => {
+            set_err(err_msg_ptr, e);
+            PEARL_CAPI_ERR_BAD_ARG
+        }
+        Err(_) => {
+            set_err(err_msg_ptr, "panic during plain_proof_encode_dense");
+            PEARL_CAPI_ERR_INTERNAL
+        }
+    }
+}

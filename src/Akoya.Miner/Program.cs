@@ -1,7 +1,12 @@
 // Akoya.Miner v2
 //
 // Subcommands:
-//   mine-blocks               Connect to pool, register/resume, mine.
+//   mine-blocks               Connect to Akoya V2 pool, register/resume, mine.
+//   luckypool-test            Connect/auth to LuckyPool, print first real job, exit.
+//   luckypool-mine-test       Experimental LuckyPool GPU dry-run; NEVER submits shares.
+//   luckypool-submit-test     Submit exactly one locally validated LuckyPool share, print result, exit.
+//   luckypool-mine            Continuous LuckyPool Stratum mining with live share submission + reconnect.
+//   perf-iter                 Profile the steady-state GPU iteration loop (no pool/network required).
 //   version | --version | -V  Print git sha + miner version.
 //
 // Runtime native libs:
@@ -11,12 +16,14 @@
 //
 // All other configuration is read once at startup by EnvVarBindings.Load.
 
+using System.Diagnostics;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using Akoya.Miner.Config;
 using Akoya.Miner.Mining;
+using Akoya.Miner.Stratum;
 using Akoya.Cuda;
 using Akoya.Miner.Observability;
 using Akoya.Mining;
@@ -92,10 +99,715 @@ var cmd = args.Length > 0 ? args[0] : "mine-blocks";
 return cmd switch
 {
     "mine-blocks"                    => await MineBlocksAsync(args),
+    "luckypool-test"                 => await LuckyPoolTestAsync(args),
+    "luckypool-mine-test"            => await LuckyPoolMineTestAsync(args),
+    "luckypool-submit-test"          => await LuckyPoolSubmitTestAsync(args),
+    "luckypool-mine"                 => await LuckyPoolMineAsync(args),
+    "perf-iter"                      => PerfIter(args),
     "selftest" or "--selftest"       => await SelfTestAsync(args),
     "version" or "--version" or "-V" => PrintVersion(),
     _                                => Usage(cmd),
 };
+
+static async Task<int> LuckyPoolTestAsync(string[] _)
+{
+    var host =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_HOST")
+        ?? "pearl-eu2.luckypool.io";
+
+    var portString =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_PORT")
+        ?? "3360";
+
+    var wallet =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_WALLET");
+
+    if (string.IsNullOrWhiteSpace(wallet))
+    {
+        Console.Error.WriteLine(
+            "ERROR: LUCKYPOOL_WALLET environment variable is required.");
+
+        return 78;
+    }
+
+    var worker =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_WORKER")
+        ?? Environment.MachineName;
+
+    if (!int.TryParse(portString, out var port) ||
+        port < 1 ||
+        port > 65535)
+    {
+        Console.Error.WriteLine(
+            $"ERROR: Invalid LUCKYPOOL_PORT: {portString}");
+
+        return 78;
+    }
+
+    using var cts = new CancellationTokenSource();
+
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+
+        Console.WriteLine();
+        Console.WriteLine(
+            "LuckyPool: Ctrl-C received, shutting down...");
+
+        cts.Cancel();
+    };
+
+    try
+    {
+        await using var client =
+            new LuckyPoolClient(
+                host,
+                port,
+                wallet,
+                worker);
+
+        await client.RunUntilFirstJobAsync(
+            cts.Token);
+
+        return 0;
+    }
+    catch (OperationCanceledException)
+    {
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine();
+        Console.Error.WriteLine(
+            "LuckyPool test failed:");
+        Console.Error.WriteLine(ex);
+
+        return 1;
+    }
+}
+
+
+static async Task<int> LuckyPoolMineTestAsync(string[] _)
+{
+    using var loggerFactory = BuildLoggerFactory();
+    var log = loggerFactory.CreateLogger("luckypool-mine-test");
+
+    var host =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_HOST")
+        ?? "pearl-eu2.luckypool.io";
+
+    var portString =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_PORT")
+        ?? "3360";
+
+    var wallet =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_WALLET");
+
+    if (string.IsNullOrWhiteSpace(wallet))
+    {
+        log.LogError("LUCKYPOOL_WALLET environment variable is required.");
+        return 78;
+    }
+
+    var worker =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_WORKER")
+        ?? Environment.MachineName;
+
+    if (!int.TryParse(portString, out var port) || port < 1 || port > 65535)
+    {
+        log.LogError("Invalid LUCKYPOOL_PORT: {Port}", portString);
+        return 78;
+    }
+
+    // EnvVarBindings still owns the common GPU/mining configuration.  It also
+    // expects the normal Akoya pool identity variables, even though this
+    // subcommand never opens an Akoya gRPC connection. Mirror the LuckyPool
+    // identity only when the caller did not explicitly set the Akoya values.
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_POOL_WALLET")))
+        Environment.SetEnvironmentVariable("AKOYA_POOL_WALLET", wallet);
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_POOL_WORKER")))
+        Environment.SetEnvironmentVariable("AKOYA_POOL_WORKER", worker);
+
+    MinerOptions opts;
+    try
+    {
+        opts = EnvVarBindings.Load(log);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "LuckyPool dry-run: configuration error");
+        return 78;
+    }
+
+    log.LogWarning(
+        "LuckyPool GPU DRY-RUN — host={Host}:{Port} wallet={Wallet} worker={Worker} GPUs={Gpus}; finalized candidates are logged and DROPPED, never submitted",
+        host, port, wallet, worker, opts.Gpus.IndicesRaw);
+
+    using var cts = new CancellationTokenSource();
+
+    static void TryCancel(CancellationTokenSource c)
+    {
+        try { c.Cancel(); }
+        catch (ObjectDisposedException) { /* shutdown race — fine */ }
+    }
+
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        log.LogInformation("LuckyPool dry-run: Ctrl-C received — stopping workers");
+        TryCancel(cts);
+    };
+
+    using var sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+    {
+        ctx.Cancel = true;
+        log.LogInformation("LuckyPool dry-run: SIGTERM received — stopping workers");
+        TryCancel(cts);
+    });
+
+    using var sigHup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx =>
+    {
+        ctx.Cancel = true;
+        log.LogInformation("LuckyPool dry-run: SIGHUP received — stopping workers");
+        TryCancel(cts);
+    });
+
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => TryCancel(cts);
+
+    using var shutdownDeadline = ShutdownDeadline.Arm(
+        cts.Token,
+        TimeSpan.FromSeconds(30),
+        () => Environment.Exit(ShutdownDeadline.HardExitCode),
+        log);
+
+    try
+    {
+        await using var client = new LuckyPoolClient(host, port, wallet, worker);
+        await using var orchestrator = new WorkerOrchestrator(opts, loggerFactory);
+
+        await orchestrator
+            .RunLuckyPoolDryRunAsync(client, cts.Token)
+            .ConfigureAwait(false);
+
+        return 0;
+    }
+    catch (OperationCanceledException) when (cts.IsCancellationRequested)
+    {
+        return 0;
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "LuckyPool GPU dry-run failed");
+        return 1;
+    }
+}
+
+static async Task<int> LuckyPoolSubmitTestAsync(string[] _)
+{
+    using var loggerFactory = BuildLoggerFactory();
+    var log = loggerFactory.CreateLogger("luckypool-submit-test");
+
+    var host =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_HOST")
+        ?? "pearl-eu2.luckypool.io";
+
+    var portString =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_PORT")
+        ?? "3360";
+
+    var wallet =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_WALLET");
+
+    if (string.IsNullOrWhiteSpace(wallet))
+    {
+        log.LogError("LUCKYPOOL_WALLET environment variable is required.");
+        return 78;
+    }
+
+    var worker =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_WORKER")
+        ?? Environment.MachineName;
+
+    if (!int.TryParse(portString, out var port) || port < 1 || port > 65535)
+    {
+        log.LogError("Invalid LUCKYPOOL_PORT: {Port}", portString);
+        return 78;
+    }
+
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_POOL_WALLET")))
+        Environment.SetEnvironmentVariable("AKOYA_POOL_WALLET", wallet);
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_POOL_WORKER")))
+        Environment.SetEnvironmentVariable("AKOYA_POOL_WORKER", worker);
+
+    MinerOptions opts;
+    try
+    {
+        opts = EnvVarBindings.Load(log);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "LuckyPool submit-test: configuration error");
+        return 78;
+    }
+
+    log.LogWarning(
+        "LuckyPool LIVE ONE-SHARE SUBMIT TEST — host={Host}:{Port} wallet={Wallet} worker={Worker} GPUs={Gpus}. The first locally validated current-job PlainProof WILL be submitted; the process exits after the pool response.",
+        host, port, wallet, worker, opts.Gpus.IndicesRaw);
+
+    using var cts = new CancellationTokenSource();
+
+    static void TryCancel(CancellationTokenSource c)
+    {
+        try { c.Cancel(); }
+        catch (ObjectDisposedException) { /* shutdown race — fine */ }
+    }
+
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        log.LogInformation("LuckyPool submit-test: Ctrl-C received — stopping workers");
+        TryCancel(cts);
+    };
+
+    using var sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+    {
+        ctx.Cancel = true;
+        log.LogInformation("LuckyPool submit-test: SIGTERM received — stopping workers");
+        TryCancel(cts);
+    });
+
+    using var sigHup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx =>
+    {
+        ctx.Cancel = true;
+        log.LogInformation("LuckyPool submit-test: SIGHUP received — stopping workers");
+        TryCancel(cts);
+    });
+
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => TryCancel(cts);
+
+    using var shutdownDeadline = ShutdownDeadline.Arm(
+        cts.Token,
+        TimeSpan.FromSeconds(30),
+        () => Environment.Exit(ShutdownDeadline.HardExitCode),
+        log);
+
+    try
+    {
+        await using var client = new LuckyPoolClient(host, port, wallet, worker);
+        await using var orchestrator = new WorkerOrchestrator(opts, loggerFactory);
+
+        var result = await orchestrator
+            .RunLuckyPoolSubmitTestAsync(client, cts.Token)
+            .ConfigureAwait(false);
+
+        if (result.Accepted)
+        {
+            log.LogWarning(
+                "LuckyPool submit-test COMPLETE: ACCEPTED requestId={Id} result={Result}",
+                result.RequestId,
+                result.ResultJson);
+            return 0;
+        }
+
+        log.LogWarning(
+            "LuckyPool submit-test COMPLETE: REJECTED requestId={Id} result={Result} error={Error}",
+            result.RequestId,
+            result.ResultJson,
+            result.ErrorJson ?? "(none)");
+        return 2;
+    }
+    catch (OperationCanceledException) when (cts.IsCancellationRequested)
+    {
+        log.LogInformation("LuckyPool submit-test cancelled before a pool response was received.");
+        return 130;
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "LuckyPool one-share submit-test failed");
+        return 1;
+    }
+}
+
+static async Task<int> LuckyPoolMineAsync(string[] _)
+{
+    using var loggerFactory = BuildLoggerFactory();
+    var log = loggerFactory.CreateLogger("luckypool-mine");
+
+    var host =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_HOST")
+        ?? "pearl-eu2.luckypool.io";
+
+    var portString =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_PORT")
+        ?? "3360";
+
+    var wallet =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_WALLET");
+
+    if (string.IsNullOrWhiteSpace(wallet))
+    {
+        log.LogError("LUCKYPOOL_WALLET environment variable is required.");
+        return 78;
+    }
+
+    var worker =
+        Environment.GetEnvironmentVariable("LUCKYPOOL_WORKER")
+        ?? Environment.MachineName;
+
+    if (!int.TryParse(portString, out var port) || port < 1 || port > 65535)
+    {
+        log.LogError("Invalid LUCKYPOOL_PORT: {Port}", portString);
+        return 78;
+    }
+
+    // EnvVarBindings owns the common GPU/mining settings and still validates
+    // the normal Akoya pool identity fields. Mirror the LuckyPool identity
+    // only when those compatibility variables were not explicitly provided.
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_POOL_WALLET")))
+        Environment.SetEnvironmentVariable("AKOYA_POOL_WALLET", wallet);
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_POOL_WORKER")))
+        Environment.SetEnvironmentVariable("AKOYA_POOL_WORKER", worker);
+
+    MinerOptions opts;
+    try
+    {
+        opts = EnvVarBindings.Load(log);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "LuckyPool mining: configuration error");
+        return 78;
+    }
+
+    if (opts.Mine.NoiseRank != 128)
+    {
+        log.LogError(
+            "LuckyPool mining requires noise rank 128; configured R={Rank}.",
+            opts.Mine.NoiseRank);
+        return 78;
+    }
+
+    log.LogWarning(
+        "LuckyPool LIVE MINING — host={Host}:{Port} wallet={Wallet} worker={Worker} GPUs={Gpus}; locally validated PlainProof shares WILL be submitted continuously",
+        host,
+        port,
+        wallet,
+        worker,
+        opts.Gpus.IndicesRaw);
+
+    using var cts = new CancellationTokenSource();
+
+    static void TryCancel(CancellationTokenSource c)
+    {
+        try { c.Cancel(); }
+        catch (ObjectDisposedException) { /* shutdown race */ }
+    }
+
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        log.LogInformation("LuckyPool mining: Ctrl-C received — graceful shutdown");
+        TryCancel(cts);
+    };
+
+    using var sigTerm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
+    {
+        ctx.Cancel = true;
+        log.LogInformation("LuckyPool mining: SIGTERM received — graceful shutdown");
+        TryCancel(cts);
+    });
+
+    using var sigHup = PosixSignalRegistration.Create(PosixSignal.SIGHUP, ctx =>
+    {
+        ctx.Cancel = true;
+        log.LogInformation("LuckyPool mining: SIGHUP received — graceful shutdown");
+        TryCancel(cts);
+    });
+
+    using var sigQuit = PosixSignalRegistration.Create(PosixSignal.SIGQUIT, ctx =>
+    {
+        ctx.Cancel = true;
+        log.LogInformation("LuckyPool mining: SIGQUIT received — graceful shutdown");
+        TryCancel(cts);
+    });
+
+    AppDomain.CurrentDomain.ProcessExit += (_, _) => TryCancel(cts);
+
+    using var shutdownDeadline = ShutdownDeadline.Arm(
+        cts.Token,
+        TimeSpan.FromSeconds(30),
+        () => Environment.Exit(ShutdownDeadline.HardExitCode),
+        log);
+
+    if (opts.Observability.MetricsPort is int metricsPort)
+        Metrics.TryStart(metricsPort, loggerFactory.CreateLogger("metrics"), cts.Token);
+
+    await using var orchestrator = new WorkerOrchestrator(opts, loggerFactory);
+
+    int attempt = 0;
+
+    while (!cts.IsCancellationRequested)
+    {
+        var sessionStarted = Stopwatch.GetTimestamp();
+
+        try
+        {
+            await using var client =
+                new LuckyPoolClient(host, port, wallet, worker);
+
+            await orchestrator
+                .RunLuckyPoolMineAsync(client, cts.Token)
+                .ConfigureAwait(false);
+
+            // An uncancelled production session should not return normally,
+            // but if it does, treat it as a transient disconnect.
+            var ranFor = Stopwatch.GetElapsedTime(sessionStarted);
+            attempt = ranFor >= TimeSpan.FromSeconds(30) ? 1 : attempt + 1;
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+            break;
+        }
+        catch (Exception ex)
+        {
+            var ranFor = Stopwatch.GetElapsedTime(sessionStarted);
+            attempt = ranFor >= TimeSpan.FromSeconds(30) ? 1 : attempt + 1;
+
+            // Config/native compatibility problems do not improve by opening
+            // another TCP connection. Fail fast rather than reconnect forever.
+            if (ex is InvalidOperationException &&
+                (ex.Message.Contains("No CUDA devices", StringComparison.OrdinalIgnoreCase) ||
+                 ex.Message.Contains("does not support GPU", StringComparison.OrdinalIgnoreCase) ||
+                 ex.Message.Contains("requires AKOYA_MINE_NOISE_RANK=128", StringComparison.OrdinalIgnoreCase)))
+            {
+                log.LogError(ex, "LuckyPool mining: fatal local configuration/native error");
+                return 78;
+            }
+
+            log.LogWarning(
+                ex,
+                "LuckyPool session ended — reconnecting (attempt {Attempt})",
+                attempt);
+        }
+
+        if (cts.IsCancellationRequested)
+            break;
+
+        var baseSeconds = attempt switch
+        {
+            <= 1 => 1.0,
+            2    => 2.0,
+            3    => 5.0,
+            4    => 10.0,
+            5    => 20.0,
+            _    => 30.0,
+        };
+
+        // ±20% jitter prevents multiple rigs behind the same NAT from
+        // reconnecting in lock-step after a pool restart.
+        var jitter = 0.8 + Random.Shared.NextDouble() * 0.4;
+        var delay = TimeSpan.FromSeconds(baseSeconds * jitter);
+
+        log.LogInformation(
+            "LuckyPool reconnect in {Delay:F1}s (attempt {Attempt})",
+            delay.TotalSeconds,
+            attempt);
+
+        try
+        {
+            await Task.Delay(delay, cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            break;
+        }
+    }
+
+    log.LogInformation("LuckyPool mining: shutdown complete");
+    return 0;
+}
+
+static int PerfIter(string[] args)
+{
+    using var loggerFactory = BuildLoggerFactory();
+    var log = loggerFactory.CreateLogger("perf-iter");
+
+    // perf-iter only needs the common mining/GPU configuration, but
+    // EnvVarBindings.Load() also validates the normal pool identity fields.
+    // Supply harmless local placeholders only when the operator did not set
+    // those variables. No pool/network connection is opened by this command.
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_POOL_WALLET")))
+        Environment.SetEnvironmentVariable("AKOYA_POOL_WALLET", "perf-iter-local");
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_POOL_WORKER")))
+        Environment.SetEnvironmentVariable("AKOYA_POOL_WORKER", "perf-iter");
+
+    // Do not silently use EnvVarBindings' generic fallback shape here. Normal
+    // production startup lets WorkerOrchestrator replace that fallback with a
+    // GPU-specific profile, but perf-iter calls GpuWorker directly. Requiring
+    // M/N/K explicitly keeps the measurement reproducible and guarantees we
+    // profile the exact shape the operator intends.
+    if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_MINE_M")) ||
+        string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_MINE_N")) ||
+        string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AKOYA_MINE_K")))
+    {
+        log.LogError(
+            "perf-iter requires explicit AKOYA_MINE_M, AKOYA_MINE_N and AKOYA_MINE_K values; " +
+            "for RTX 5070 Ti baseline use M=4096 N=131072 K=4096.");
+        return 78;
+    }
+
+    MinerOptions opts;
+    try
+    {
+        opts = EnvVarBindings.Load(log);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "perf-iter: configuration error");
+        return 78;
+    }
+
+    double durationSec = 15.0;
+    int runs = 1;
+
+    if (args.Length > 1 &&
+        (!double.TryParse(args[1], System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out durationSec) ||
+         !double.IsFinite(durationSec) || durationSec <= 0.0 || durationSec > 300.0))
+    {
+        log.LogError("perf-iter: duration must be > 0 and <= 300 seconds; got '{Value}'", args[1]);
+        return 64;
+    }
+
+    if (args.Length > 2 &&
+        (!int.TryParse(args[2], System.Globalization.NumberStyles.Integer,
+            System.Globalization.CultureInfo.InvariantCulture, out runs) ||
+         runs < 1 || runs > 20))
+    {
+        log.LogError("perf-iter: runs must be in [1,20]; got '{Value}'", args[2]);
+        return 64;
+    }
+
+    if (args.Length > 3)
+    {
+        log.LogError("usage: akoya-miner perf-iter [duration-sec] [runs]");
+        return 64;
+    }
+
+    int deviceOrdinal;
+    try
+    {
+        CudaDriver.Check(CudaDriver.Init(0), "cuInit");
+        CudaDriver.Check(CudaDriver.DeviceGetCount(out var deviceCount), "cuDeviceGetCount");
+        deviceOrdinal = ResolveSinglePerfGpu(opts.Gpus.IndicesRaw, deviceCount);
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "perf-iter: GPU selection failed");
+        return 78;
+    }
+
+    // Force the raw-loop profiler to mpp=1 so one timed GPU batch equals one
+    // mining iteration. All other mining options
+    // (M/N/K/R, graph, ping/pong) remain exactly as configured by env vars.
+    var mine = opts.Mine with { MatmulsPerPoll = 1 };
+
+    log.LogWarning(
+        "PERF-ITER — GPU={Gpu} shape M={M} N={N} K={K} R={R} mpp=1 graph={Graph} pong={Pong} duration={Sec:F1}s runs={Runs}; no pool connection, no shares",
+        deviceOrdinal,
+        mine.M,
+        mine.N,
+        mine.K,
+        mine.NoiseRank,
+        mine.CudaGraphIter,
+        !mine.DisablePong,
+        durationSec,
+        runs);
+
+    using var cts = new CancellationTokenSource();
+    Console.CancelKeyPress += (_, e) =>
+    {
+        e.Cancel = true;
+        try { cts.Cancel(); } catch (ObjectDisposedException) { }
+    };
+
+    try
+    {
+        for (int run = 1; run <= runs && !cts.IsCancellationRequested; run++)
+        {
+            var r = GpuWorker.RunIterLoopBenchmark(
+                deviceOrdinal,
+                mine,
+                TimeSpan.FromSeconds(durationSec),
+                loggerFactory.CreateLogger($"perf-iter-{deviceOrdinal}"),
+                run,
+                cts.Token);
+
+            double tmadsPerSec =
+                ((double)mine.M * mine.N * mine.K * r.ItersPerSec) / 1e12;
+
+            log.LogWarning(
+                "PERF-ITER RESULT run={Run}/{Runs}: iters={Iters} samples={Samples} sec={Sec:F3} iters/s={Ips:F3} iter_ms={IterMs:F3} tmads/s={Tmads:F3}",
+                run, runs, r.IterCount, r.Samples, r.DurationSec,
+                r.ItersPerSec, r.IterMs, tmadsPerSec);
+
+            log.LogWarning(
+                "PERF-ITER GPU: batch_p50={GpuP50:F3}ms batch_p95={GpuP95:F3}ms sync_p50={SyncP50:F3}ms sync_p95={SyncP95:F3}ms",
+                r.GpuBatchP50Ms, r.GpuBatchP95Ms,
+                r.SyncWaitP50Ms, r.SyncWaitP95Ms);
+
+            log.LogWarning(
+                "PERF-ITER HOST: loop_p50={LoopP50:F3}ms loop_p95={LoopP95:F3}ms queue_p50={QueueP50:F3}ms queue_p95={QueueP95:F3}ms host_nonwait_p50={HostP50:F3}ms scan_p50={ScanP50:F3}ms",
+                r.LoopBatchWallP50Ms, r.LoopBatchWallP95Ms,
+                r.QueueP50Ms, r.QueueP95Ms,
+                r.HostNonWaitP50Ms, r.ScanP50Ms);
+
+            log.LogWarning(
+                "PERF-ITER ENQUEUE: header_clear_p50={HeaderClear:F3}ms header_ptr_p50={HeaderPtr:F3}ms device_clear_p50={DeviceClear:F3}ms iter_enqueue_p50={IterEnqueue:F3}ms graph_launch_p50={GraphLaunch:F3}ms graph_launches={GraphCount}",
+                r.HeaderClearP50Ms, r.HeaderPtrP50Ms,
+                r.DeviceClearEnqueueP50Ms, r.IterEnqueueP50Ms,
+                r.GraphLaunchP50Ms, r.GraphLaunchCount);
+        }
+
+        return cts.IsCancellationRequested ? 130 : 0;
+    }
+    catch (OperationCanceledException) when (cts.IsCancellationRequested)
+    {
+        return 130;
+    }
+    catch (Exception ex)
+    {
+        log.LogError(ex, "perf-iter failed");
+        return 1;
+    }
+}
+
+static int ResolveSinglePerfGpu(string raw, int deviceCount)
+{
+    if (deviceCount <= 0)
+        throw new InvalidOperationException("No CUDA devices found");
+
+    raw = string.IsNullOrWhiteSpace(raw) ? "all" : raw.Trim();
+    if (raw.Equals("all", StringComparison.OrdinalIgnoreCase))
+    {
+        if (deviceCount == 1) return 0;
+        throw new InvalidOperationException(
+            $"perf-iter profiles exactly one GPU; {deviceCount} CUDA devices are present. " +
+            "Set AKOYA_GPU_INDICES=<single 0-based index>, e.g. AKOYA_GPU_INDICES=2.");
+    }
+
+    var tokens = raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    if (tokens.Length != 1 || !int.TryParse(tokens[0], out var ordinal))
+        throw new FormatException(
+            $"perf-iter requires exactly one AKOYA_GPU_INDICES value; got '{raw}'");
+
+    if (ordinal < 0 || ordinal >= deviceCount)
+        throw new ArgumentOutOfRangeException(
+            nameof(raw),
+            $"GPU index {ordinal} out of range [0, {deviceCount})");
+
+    return ordinal;
+}
 
 static async Task<int> MineBlocksAsync(string[] _)
 {
@@ -299,18 +1011,22 @@ static async Task<int> MineBlocksAsync(string[] _)
 static int PrintVersion()
 {
     Console.WriteLine($"akoya-miner v{VersionInfo.MinerVersion} (git {VersionInfo.GitSha})");
-    Console.WriteLine("V2 protocol — gRPC + per-miner jobKey (pool-only)");
+    Console.WriteLine("V2 gRPC miner + LuckyPool Stratum mining support");
     return 0;
 }
 
 static int Usage(string c)
 {
     Console.Error.WriteLine($"unknown subcommand: {c}");
-    Console.Error.WriteLine("usage: akoya-miner [mine-blocks|selftest|version]");
-    Console.Error.WriteLine("  mine-blocks  Connect to pool, register/resume, mine. (default)");
-    Console.Error.WriteLine("  selftest     Validate config + pool + native libs + session store; emit JSON; exit 0/1.");
-    Console.Error.WriteLine("  version      Print git sha + miner version.");
-    Console.Error.WriteLine("note: V2 is pool-only; there is no solo/direct mining mode.");
+    Console.Error.WriteLine("usage: akoya-miner [mine-blocks|luckypool-test|luckypool-mine-test|luckypool-submit-test|luckypool-mine|perf-iter|selftest|version]");
+    Console.Error.WriteLine("  mine-blocks          Connect to Akoya V2 pool, register/resume, mine. (default)");
+    Console.Error.WriteLine("  luckypool-test       Connect/auth to LuckyPool, print first mining.notify job, exit.");
+    Console.Error.WriteLine("  luckypool-mine-test    Experimental GPU dry-run on LuckyPool jobs; candidates are NEVER submitted.");
+    Console.Error.WriteLine("  luckypool-submit-test  LIVE test: submit exactly one locally validated current-job PlainProof, print pool result, exit.");
+    Console.Error.WriteLine("  luckypool-mine         Continuous LuckyPool mining: validate + submit shares, reconnect automatically.");
+    Console.Error.WriteLine("  perf-iter              Profile one GPU steady-state iteration loop; usage: perf-iter [duration-sec] [runs].");
+    Console.Error.WriteLine("  selftest             Validate config + pool + native libs + session store; emit JSON; exit 0/1.");
+    Console.Error.WriteLine("  version              Print git sha + miner version.");
     return 64;
 }
 

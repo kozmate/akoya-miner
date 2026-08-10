@@ -25,6 +25,7 @@ using System.Diagnostics;
 using Akoya.Cuda;
 using Akoya.Miner.Config;
 using Akoya.Miner.Observability;
+using Akoya.Miner.Stratum;
 using Akoya.MinerCore;
 using Akoya.PearlGemm;
 using Akoya.Pool;
@@ -702,6 +703,602 @@ internal sealed class WorkerOrchestrator : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Experimental LuckyPool Stratum GPU dry-run.
+    ///
+    /// Reuses the production GPU enumeration, per-card profile selection,
+    /// benchmark/Mpp sizing, JobBus and GpuWorker pipeline, but replaces the
+    /// Akoya gRPC MiningSession with <see cref="LuckyPoolClient"/> and replaces
+    /// the network share sink with a sink that only logs + drops candidates.
+    /// No ShareSubmission is sent to LuckyPool by this method.
+    /// </summary>
+    public async Task RunLuckyPoolDryRunAsync(
+        LuckyPoolClient client,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(client);
+
+        var gpus = EnumerateGpus();
+        if (gpus.Count == 0)
+            throw new InvalidOperationException("No CUDA devices found.");
+
+        EnsureNativeGemmSupportsGpus(gpus);
+
+        var mineProfile = ApplyGpuProfileDefaults(
+            _opts.Mine,
+            gpus,
+            _opts.Mine.ShapeOverridePresent,
+            out var mineProfileName);
+
+        if (!mineProfile.Equals(_opts.Mine))
+        {
+            _log.LogInformation(
+                "luckypool dry-run: mine-profile auto-selected {Profile}",
+                mineProfileName);
+        }
+
+        Metrics.Init(gpus.Count, new long[gpus.Count]);
+
+        // Keep the exact same benchmark + MPP sizing logic as production.
+        var bench = RunOrReuseBenchmark(
+            gpus,
+            (ord, log, token) => GpuWorker.RunBenchmark(
+                ord,
+                mineProfile,
+                TimeSpan.FromSeconds(Math.Max(1, mineProfile.BenchmarkDurationSec)),
+                log,
+                token),
+            ct);
+
+        var mine = mineProfile with { MatmulsPerPoll = bench.Mpp };
+
+        _log.LogInformation(
+            "luckypool dry-run: {N} GPU(s), profile={Profile}, benchmark={Hashrate:F2} TMADs/s, mpp={Mpp}, shape M={M} N={Ndim} K={K} R={R}",
+            gpus.Count,
+            mineProfileName,
+            bench.Total,
+            bench.Mpp,
+            mine.M,
+            mine.N,
+            mine.K,
+            mine.NoiseRank);
+
+        var bus = new JobBus();
+        var sink = new LuckyPoolDryRunShareSink(
+            _loggerFactory.CreateLogger("luckypool-dry-run-share"));
+
+        // GpuWorker currently keeps minerId for V2 compatibility but the
+        // LuckyPool jobKey path intentionally does not depend on it. Keep a
+        // structurally valid 16-byte placeholder so the worker contract stays
+        // future-proof if that field becomes validated later.
+        ReadOnlyMemory<byte> dryRunMinerId = Guid.Empty.ToByteArray();
+
+        using var workerTripCts =
+            CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        Exception? workerFatal = null;
+        var workers = new List<GpuWorker>(gpus.Count);
+
+        Action<GpuWorker, Exception> tripOnFatal = (w, ex) =>
+        {
+            Interlocked.CompareExchange(ref workerFatal, ex, null);
+            _log.LogError(
+                ex,
+                "luckypool dry-run: worker[{Gpu}] fatal — stopping dry-run",
+                w.GpuIndex);
+            try { workerTripCts.Cancel(); } catch { /* shutdown race */ }
+        };
+
+        for (int i = 0; i < gpus.Count; i++)
+        {
+            var w = new GpuWorker(
+                gpuIndex:      i,
+                deviceOrdinal: gpus[i].Ordinal,
+                gpuUuid:       gpus[i].Uuid,
+                bus:           bus,
+                sink:          sink,
+                minerId:       dryRunMinerId,
+                mine:          mine,
+                log:           _loggerFactory.CreateLogger($"luckypool-gpu-{i}"),
+                onFatal:       tripOnFatal);
+
+            w.Start(workerTripCts.Token);
+            workers.Add(w);
+        }
+
+        try
+        {
+            await client.RunJobLoopAsync(
+                job =>
+                {
+                    var ctx = SigmaContext.FromLuckyPoolJob(
+                        job,
+                        (uint)mine.K,
+                        (ushort)mine.NoiseRank);
+
+                    bus.Publish(ctx);
+                    Metrics.SetPoolConnected(true);
+
+                    _log.LogInformation(
+                        "luckypool dry-run: job published external={ExternalJob} internal={InternalJob} height={Height} targetBits={TargetBits} sigma={SigmaPrefix}",
+                        job.JobId,
+                        ctx.JobId,
+                        ctx.BlockHeight,
+                        ctx.EffectiveTarget.GetBitLength(),
+                        Convert.ToHexString(ctx.Sigma.AsSpan(0, Math.Min(8, ctx.Sigma.Length))));
+
+                    return ValueTask.CompletedTask;
+                },
+                workerTripCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (workerTripCts.IsCancellationRequested)
+        {
+            // External shutdown or a worker fatal. We distinguish below after
+            // workers have had a chance to tear down cleanly.
+        }
+        finally
+        {
+            Metrics.SetPoolConnected(false);
+
+            await Task.WhenAll(
+                    workers.Select(w => w.DisposeAsync().AsTask()))
+                .ConfigureAwait(false);
+
+            foreach (var w in workers)
+            {
+                if (!w.DisposeWasClean)
+                {
+                    _log.LogCritical(
+                        "luckypool dry-run: worker[{Gpu}] did not exit cleanly",
+                        w.GpuIndex);
+                }
+            }
+        }
+
+        if (workerFatal is not null && !ct.IsCancellationRequested)
+            throw new WorkerTripException("luckypool_dryrun_worker_fatal", workerFatal);
+
+        ct.ThrowIfCancellationRequested();
+    }
+
+    /// <summary>
+    /// LuckyPool one-share live submit test.
+    ///
+    /// Runs the same GPU + PlainProof pipeline as the dry-run, but the first
+    /// locally validated, non-stale PlainProof is sent with mining.submit.
+    /// The pool response is awaited and then all workers are stopped. Exactly
+    /// one share can reach the wire from this method.
+    /// </summary>
+    public async Task<LuckyPoolSubmitResult> RunLuckyPoolSubmitTestAsync(
+        LuckyPoolClient client,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(client);
+
+        var gpus = EnumerateGpus();
+        if (gpus.Count == 0)
+            throw new InvalidOperationException("No CUDA devices found.");
+
+        EnsureNativeGemmSupportsGpus(gpus);
+
+        var mineProfile = ApplyGpuProfileDefaults(
+            _opts.Mine,
+            gpus,
+            _opts.Mine.ShapeOverridePresent,
+            out var mineProfileName);
+
+        if (!mineProfile.Equals(_opts.Mine))
+        {
+            _log.LogInformation(
+                "luckypool submit-test: mine-profile auto-selected {Profile}",
+                mineProfileName);
+        }
+
+        Metrics.Init(gpus.Count, new long[gpus.Count]);
+
+        var bench = RunOrReuseBenchmark(
+            gpus,
+            (ord, log, token) => GpuWorker.RunBenchmark(
+                ord,
+                mineProfile,
+                TimeSpan.FromSeconds(Math.Max(1, mineProfile.BenchmarkDurationSec)),
+                log,
+                token),
+            ct);
+
+        var mine = mineProfile with { MatmulsPerPoll = bench.Mpp };
+
+        // The current rank-penalty softfork uses 128 as the base rank. Our
+        // Stratum target path is intentionally implemented for the no-penalty
+        // R=128 case; refuse a live submit at another rank rather than risk
+        // sending a share whose jackpot bound was not rank-penalized.
+        if (mine.NoiseRank != 128)
+        {
+            throw new InvalidOperationException(
+                $"luckypool-submit-test currently requires AKOYA_MINE_NOISE_RANK=128; got {mine.NoiseRank}.");
+        }
+
+        _log.LogWarning(
+            "luckypool submit-test LIVE: {N} GPU(s), profile={Profile}, benchmark={Hashrate:F2} TMADs/s, mpp={Mpp}, shape M={M} N={Ndim} K={K} R={R}; exactly ONE locally validated current-job share will be submitted",
+            gpus.Count,
+            mineProfileName,
+            bench.Total,
+            bench.Mpp,
+            mine.M,
+            mine.N,
+            mine.K,
+            mine.NoiseRank);
+
+        var bus = new JobBus();
+
+        using var workerTripCts =
+            CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        static void TryCancel(CancellationTokenSource c)
+        {
+            try { c.Cancel(); }
+            catch (ObjectDisposedException) { /* shutdown race */ }
+        }
+
+        var sink = new LuckyPoolSubmitTestShareSink(
+            client,
+            () => TryCancel(workerTripCts),
+            _loggerFactory.CreateLogger("luckypool-submit-share"));
+
+        ReadOnlyMemory<byte> submitTestMinerId = Guid.Empty.ToByteArray();
+
+        Exception? workerFatal = null;
+        var workers = new List<GpuWorker>(gpus.Count);
+
+        Action<GpuWorker, Exception> tripOnFatal = (w, ex) =>
+        {
+            Interlocked.CompareExchange(ref workerFatal, ex, null);
+            _log.LogError(
+                ex,
+                "luckypool submit-test: worker[{Gpu}] fatal — stopping",
+                w.GpuIndex);
+            TryCancel(workerTripCts);
+        };
+
+        for (int i = 0; i < gpus.Count; i++)
+        {
+            var w = new GpuWorker(
+                gpuIndex:      i,
+                deviceOrdinal: gpus[i].Ordinal,
+                gpuUuid:       gpus[i].Uuid,
+                bus:           bus,
+                sink:          sink,
+                minerId:       submitTestMinerId,
+                mine:          mine,
+                log:           _loggerFactory.CreateLogger($"luckypool-gpu-{i}"),
+                onFatal:       tripOnFatal);
+
+            w.Start(workerTripCts.Token);
+            workers.Add(w);
+        }
+
+        try
+        {
+            await client.RunJobLoopAsync(
+                job =>
+                {
+                    var ctx = SigmaContext.FromLuckyPoolJob(
+                        job,
+                        (uint)mine.K,
+                        (ushort)mine.NoiseRank);
+
+                    bus.Publish(ctx);
+                    Metrics.SetPoolConnected(true);
+
+                    _log.LogInformation(
+                        "luckypool submit-test: job published external={ExternalJob} internal={InternalJob} height={Height} targetBits={TargetBits} sigma={SigmaPrefix}",
+                        job.JobId,
+                        ctx.JobId,
+                        ctx.BlockHeight,
+                        ctx.EffectiveTarget.GetBitLength(),
+                        Convert.ToHexString(ctx.Sigma.AsSpan(0, Math.Min(8, ctx.Sigma.Length))));
+
+                    return ValueTask.CompletedTask;
+                },
+                workerTripCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (workerTripCts.IsCancellationRequested)
+        {
+            // Expected after the one submit response, external shutdown, or worker fatal.
+        }
+        finally
+        {
+            Metrics.SetPoolConnected(false);
+
+            await Task.WhenAll(
+                    workers.Select(w => w.DisposeAsync().AsTask()))
+                .ConfigureAwait(false);
+
+            foreach (var w in workers)
+            {
+                if (!w.DisposeWasClean)
+                {
+                    _log.LogCritical(
+                        "luckypool submit-test: worker[{Gpu}] did not exit cleanly",
+                        w.GpuIndex);
+                }
+            }
+        }
+
+        if (workerFatal is not null && !ct.IsCancellationRequested)
+            throw new WorkerTripException("luckypool_submit_test_worker_fatal", workerFatal);
+
+        ct.ThrowIfCancellationRequested();
+        return await sink.Completion.ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Continuous LuckyPool Stratum mining mode.
+    ///
+    /// Reuses the production GPU profile/benchmark/JobBus/GpuWorker pipeline,
+    /// converts every locally validated current-job candidate into PlainProof,
+    /// submits it to LuckyPool, records accepted/rejected/stale/error totals,
+    /// and keeps mining until the connection fails, a worker trips, or the
+    /// caller cancels. Connection retries are owned by Program.cs so a fresh
+    /// LuckyPoolClient is used for every TCP session while this orchestrator
+    /// keeps its cached GPU benchmark across reconnects.
+    /// </summary>
+    public async Task RunLuckyPoolMineAsync(
+        LuckyPoolClient client,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(client);
+
+        var gpus = EnumerateGpus();
+        if (gpus.Count == 0)
+            throw new InvalidOperationException("No CUDA devices found.");
+
+        EnsureNativeGemmSupportsGpus(gpus);
+
+        var mineProfile = ApplyGpuProfileDefaults(
+            _opts.Mine,
+            gpus,
+            _opts.Mine.ShapeOverridePresent,
+            out var mineProfileName);
+
+        if (!mineProfile.Equals(_opts.Mine))
+        {
+            _log.LogInformation(
+                "luckypool-mine: mine-profile auto-selected {Profile}",
+                mineProfileName);
+        }
+
+        Metrics.Init(gpus.Count, new long[gpus.Count]);
+
+        var bench = RunOrReuseBenchmark(
+            gpus,
+            (ord, log, token) => GpuWorker.RunBenchmark(
+                ord,
+                mineProfile,
+                TimeSpan.FromSeconds(Math.Max(1, mineProfile.BenchmarkDurationSec)),
+                log,
+                token),
+            ct);
+
+        var mine = mineProfile with { MatmulsPerPoll = bench.Mpp };
+
+        // Base-rank mining is the current no-penalty consensus path. The full
+        // target used by the Stratum path is the pool's base target, so refuse
+        // to run a production LuckyPool session with a rank that would require
+        // rank-penalty target adjustment.
+        if (mine.NoiseRank != 128)
+        {
+            throw new InvalidOperationException(
+                $"luckypool-mine requires AKOYA_MINE_NOISE_RANK=128; got {mine.NoiseRank}.");
+        }
+
+        _log.LogWarning(
+            "luckypool-mine LIVE: {N} GPU(s), profile={Profile}, benchmark={Hashrate:F2} TMADs/s, mpp={Mpp}, shape M={M} N={Ndim} K={K} R={R}",
+            gpus.Count,
+            mineProfileName,
+            bench.Total,
+            bench.Mpp,
+            mine.M,
+            mine.N,
+            mine.K,
+            mine.NoiseRank);
+
+        var bus = new JobBus();
+
+        using var workerTripCts =
+            CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        static void TryCancel(CancellationTokenSource c)
+        {
+            try { c.Cancel(); }
+            catch (ObjectDisposedException) { /* shutdown race */ }
+        }
+
+        Exception? workerFatal = null;
+        Exception? submitFatal = null;
+
+        void TripOnSubmitError(Exception ex)
+        {
+            Interlocked.CompareExchange(ref submitFatal, ex, null);
+            TryCancel(workerTripCts);
+        }
+
+        var sink = new LuckyPoolMiningShareSink(
+            client,
+            TripOnSubmitError,
+            _loggerFactory.CreateLogger("luckypool-share"));
+
+        // LuckyPool's job-key path is independent of the Akoya V2 miner_id,
+        // but GpuWorker keeps the field as part of its generic contract.
+        ReadOnlyMemory<byte> minerId = Guid.Empty.ToByteArray();
+
+        var workers = new List<GpuWorker>(gpus.Count);
+
+        Action<GpuWorker, Exception> tripOnFatal = (w, ex) =>
+        {
+            Interlocked.CompareExchange(ref workerFatal, ex, null);
+            _log.LogError(
+                ex,
+                "luckypool-mine: worker[{Gpu}] fatal — reconnecting",
+                w.GpuIndex);
+            TryCancel(workerTripCts);
+        };
+
+        for (int i = 0; i < gpus.Count; i++)
+        {
+            var w = new GpuWorker(
+                gpuIndex:      i,
+                deviceOrdinal: gpus[i].Ordinal,
+                gpuUuid:       gpus[i].Uuid,
+                bus:           bus,
+                sink:          sink,
+                minerId:       minerId,
+                mine:          mine,
+                log:           _loggerFactory.CreateLogger($"luckypool-gpu-{i}"),
+                onFatal:       tripOnFatal);
+
+            w.Start(workerTripCts.Token);
+            workers.Add(w);
+        }
+
+        // Reuse the same worker-side liveness guard as the Akoya V2 path. A
+        // wedged CUDA worker should tear down the Stratum session instead of
+        // leaving a connected but non-mining process behind.
+        await using var workerWd = new WorkerLivenessWatchdog(
+            workers,
+            TimeSpan.FromSeconds(_opts.Mine.WatchdogTimeoutSec),
+            TimeSpan.FromSeconds(_opts.Mine.TriggerWatchdogSec),
+            workerTripCts,
+            _loggerFactory.CreateLogger("luckypool-worker-watchdog"),
+            (reason, ex) =>
+            {
+                _log.LogWarning(
+                    ex,
+                    "luckypool-mine: worker watchdog trip reason={Reason}",
+                    reason);
+                TryCancel(workerTripCts);
+            });
+        workerWd.Start();
+
+        var statsTask = RunLuckyPoolStatsLoopAsync(
+            sink,
+            _loggerFactory.CreateLogger("luckypool-stats"),
+            workerTripCts.Token);
+
+        Exception? receiveFailure = null;
+
+        try
+        {
+            await client.RunJobLoopAsync(
+                job =>
+                {
+                    var ctx = SigmaContext.FromLuckyPoolJob(
+                        job,
+                        (uint)mine.K,
+                        (ushort)mine.NoiseRank);
+
+                    bus.Publish(ctx);
+                    Metrics.SetPoolConnected(true);
+
+                    _log.LogInformation(
+                        "luckypool-mine: job published external={ExternalJob} internal={InternalJob} height={Height} targetBits={TargetBits} sigma={SigmaPrefix}",
+                        job.JobId,
+                        ctx.JobId,
+                        ctx.BlockHeight,
+                        ctx.EffectiveTarget.GetBitLength(),
+                        Convert.ToHexString(ctx.Sigma.AsSpan(0, Math.Min(8, ctx.Sigma.Length))));
+
+                    return ValueTask.CompletedTask;
+                },
+                workerTripCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (workerTripCts.IsCancellationRequested)
+        {
+            // Parent shutdown, worker/watchdog trip, or submit transport error.
+        }
+        catch (Exception ex)
+        {
+            receiveFailure = ex;
+        }
+        finally
+        {
+            Metrics.SetPoolConnected(false);
+            TryCancel(workerTripCts);
+
+            try { await statsTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { /* normal */ }
+
+            await Task.WhenAll(
+                    workers.Select(w => w.DisposeAsync().AsTask()))
+                .ConfigureAwait(false);
+
+            foreach (var w in workers)
+            {
+                if (!w.DisposeWasClean)
+                {
+                    _log.LogCritical(
+                        "luckypool-mine: worker[{Gpu}] did not exit cleanly",
+                        w.GpuIndex);
+                }
+            }
+
+            var final = sink.Snapshot();
+            _log.LogInformation(
+                "luckypool-mine session totals: submitted={Submitted} accepted={Accepted} rejected={Rejected} stale={Stale} errors={Errors}",
+                final.Submitted,
+                final.Accepted,
+                final.Rejected,
+                final.Stale,
+                final.Errors);
+        }
+
+        if (ct.IsCancellationRequested)
+            ct.ThrowIfCancellationRequested();
+
+        if (workerFatal is not null)
+            throw new WorkerTripException("luckypool_mine_worker_fatal", workerFatal);
+
+        if (submitFatal is not null)
+            throw new IOException("LuckyPool share submission transport failed.", submitFatal);
+
+        if (receiveFailure is not null)
+            throw receiveFailure;
+
+        // A normal return from an uncancelled receive loop is unexpected.
+        throw new IOException("LuckyPool job loop ended without cancellation.");
+    }
+
+    private static async Task RunLuckyPoolStatsLoopAsync(
+        LuckyPoolMiningShareSink sink,
+        ILogger log,
+        CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                var s = sink.Snapshot();
+                double acceptance = s.Submitted == 0
+                    ? 0.0
+                    : 100.0 * s.Accepted / s.Submitted;
+
+                log.LogInformation(
+                    "luckypool stats: submitted={Submitted} accepted={Accepted} rejected={Rejected} stale={Stale} errors={Errors} acceptance={Acceptance:F1}%",
+                    s.Submitted,
+                    s.Accepted,
+                    s.Rejected,
+                    s.Stale,
+                    s.Errors,
+                    acceptance);
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Normal session teardown.
+        }
+    }
+
     internal static void ThrowIfLocalWorkerTrip(
         CancellationTokenSource workerTripCts,
         string reason,
@@ -1146,6 +1743,313 @@ internal sealed class WorkerOrchestrator : IAsyncDisposable
     }
 
     // ----- IShareSink wrapping MiningSession.EnqueueAsync ---------------------
+
+    private readonly record struct LuckyPoolMiningStats(
+        long Submitted,
+        long Accepted,
+        long Rejected,
+        long Stale,
+        long Errors);
+
+    /// <summary>
+    /// Production LuckyPool PlainProof sink. Safe to share across all GPU
+    /// workers: finalizers may call it concurrently, while LuckyPoolClient
+    /// serializes socket writes and correlates responses by request id.
+    /// </summary>
+    private sealed class LuckyPoolMiningShareSink : IPlainProofSink
+    {
+        private readonly LuckyPoolClient _client;
+        private readonly Action<Exception> _tripOnTransportError;
+        private readonly ILogger _log;
+
+        private long _submitted;
+        private long _accepted;
+        private long _rejected;
+        private long _stale;
+        private long _errors;
+
+        public LuckyPoolMiningShareSink(
+            LuckyPoolClient client,
+            Action<Exception> tripOnTransportError,
+            ILogger log)
+        {
+            _client = client;
+            _tripOnTransportError = tripOnTransportError;
+            _log = log;
+        }
+
+        public LuckyPoolMiningStats Snapshot()
+            => new(
+                Submitted: Interlocked.Read(ref _submitted),
+                Accepted:  Interlocked.Read(ref _accepted),
+                Rejected:  Interlocked.Read(ref _rejected),
+                Stale:     Interlocked.Read(ref _stale),
+                Errors:    Interlocked.Read(ref _errors));
+
+        public ValueTask SubmitAsync(ShareSubmission share, CancellationToken ct)
+        {
+            _ = share;
+            _ = ct;
+            throw new InvalidOperationException(
+                "LuckyPool mining requires PlainProof; protobuf ShareSubmission fallback is disabled.");
+        }
+
+        public async ValueTask SubmitPlainProofAsync(
+            string externalJobId,
+            string plainProofBase64,
+            int plainProofBytes,
+            ShareSubmission share,
+            CancellationToken ct)
+        {
+            // Finalization is deliberately off the GPU hot path, so a notify
+            // may rotate the job while a proof is being built. Never submit a
+            // proof that is already stale according to the latest job observed
+            // by the single socket reader.
+            var latestJob = _client.LatestJobId;
+            if (!string.IsNullOrWhiteSpace(latestJob) &&
+                !string.Equals(latestJob, externalJobId, StringComparison.Ordinal))
+            {
+                var stale = Interlocked.Increment(ref _stale);
+                _log.LogInformation(
+                    "luckypool share stale-before-submit job={Job} latest={Latest} staleTotal={Stale}",
+                    externalJobId,
+                    latestJob,
+                    stale);
+                return;
+            }
+
+            var hashPrefix = share.ClaimedHash.Length > 0
+                ? Convert.ToHexString(
+                    share.ClaimedHash.Span[..Math.Min(8, share.ClaimedHash.Length)])
+                : "-";
+
+            var submitted = Interlocked.Increment(ref _submitted);
+
+            try
+            {
+                var result = await _client.SubmitPlainProofAsync(
+                    externalJobId,
+                    plainProofBase64,
+                    ct).ConfigureAwait(false);
+
+                if (result.Accepted)
+                {
+                    var accepted = Interlocked.Increment(ref _accepted);
+                    _log.LogInformation(
+                        "✓ LUCKYPOOL SHARE ACCEPTED job={Job} requestId={Id} hash={Hash} proofBytes={Bytes} submitted={Submitted} accepted={Accepted}",
+                        externalJobId,
+                        result.RequestId,
+                        hashPrefix,
+                        plainProofBytes,
+                        submitted,
+                        accepted);
+                }
+                else
+                {
+                    var rejected = Interlocked.Increment(ref _rejected);
+                    _log.LogWarning(
+                        "✗ LUCKYPOOL SHARE REJECTED job={Job} requestId={Id} hash={Hash} result={Result} error={Error} submitted={Submitted} rejected={Rejected}",
+                        externalJobId,
+                        result.RequestId,
+                        hashPrefix,
+                        result.ResultJson,
+                        result.ErrorJson ?? "(none)",
+                        submitted,
+                        rejected);
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Session teardown; do not turn a normal shutdown into a
+                // reconnect-worthy transport error.
+            }
+            catch (Exception ex)
+            {
+                var errors = Interlocked.Increment(ref _errors);
+                _log.LogWarning(
+                    ex,
+                    "luckypool mining.submit transport failure job={Job} hash={Hash} submitted={Submitted} errors={Errors}; reconnecting",
+                    externalJobId,
+                    hashPrefix,
+                    submitted,
+                    errors);
+                _tripOnTransportError(ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Terminal sink used only by luckypool-submit-test. It ignores protobuf
+    /// fallback, accepts exactly one current-job PlainProof, waits for the
+    /// LuckyPool mining.submit response, then requests orchestrator shutdown.
+    /// </summary>
+    private sealed class LuckyPoolSubmitTestShareSink : IPlainProofSink
+    {
+        private readonly LuckyPoolClient _client;
+        private readonly Action _stopAfterResponse;
+        private readonly ILogger _log;
+        private readonly TaskCompletionSource<LuckyPoolSubmitResult> _completion =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _submitClaimed;
+
+        public LuckyPoolSubmitTestShareSink(
+            LuckyPoolClient client,
+            Action stopAfterResponse,
+            ILogger log)
+        {
+            _client = client;
+            _stopAfterResponse = stopAfterResponse;
+            _log = log;
+        }
+
+        public Task<LuckyPoolSubmitResult> Completion => _completion.Task;
+
+        public ValueTask SubmitAsync(ShareSubmission share, CancellationToken ct)
+        {
+            _ = share;
+            _ = ct;
+            throw new InvalidOperationException(
+                "LuckyPool submit-test requires PlainProof; protobuf ShareSubmission fallback is disabled.");
+        }
+
+        public async ValueTask SubmitPlainProofAsync(
+            string externalJobId,
+            string plainProofBase64,
+            int plainProofBytes,
+            ShareSubmission share,
+            CancellationToken ct)
+        {
+            // A candidate can finish finalization just after a fresh notify was
+            // received. Do not spend our one live test submission on a stale job.
+            var latestJob = _client.LatestJobId;
+            if (!string.IsNullOrWhiteSpace(latestJob) &&
+                !string.Equals(latestJob, externalJobId, StringComparison.Ordinal))
+            {
+                _log.LogWarning(
+                    "LUCKYPOOL SUBMIT-TEST: stale finalized candidate skipped job={Job} latest={Latest}; waiting for a current-job candidate",
+                    externalJobId,
+                    latestJob);
+                return;
+            }
+
+            // ShareFinalizer is single-reader today, but keep the gate here so
+            // the one-share contract survives future parallel finalization.
+            if (Interlocked.CompareExchange(ref _submitClaimed, 1, 0) != 0)
+            {
+                _log.LogWarning(
+                    "LUCKYPOOL SUBMIT-TEST: additional candidate ignored; one live submission is already in flight/completed");
+                return;
+            }
+
+            var hashPrefix = share.ClaimedHash.Length > 0
+                ? Convert.ToHexString(share.ClaimedHash.Span[..Math.Min(8, share.ClaimedHash.Length)])
+                : "-";
+
+            _log.LogWarning(
+                "LUCKYPOOL SUBMIT-TEST LIVE: submitting ONE PlainProof job={Job} proofBytes={Bytes} base64Chars={Chars} hash={Hash}",
+                externalJobId,
+                plainProofBytes,
+                plainProofBase64.Length,
+                hashPrefix);
+
+            try
+            {
+                var result = await _client.SubmitPlainProofAsync(
+                    externalJobId,
+                    plainProofBase64,
+                    ct).ConfigureAwait(false);
+
+                if (result.Accepted)
+                {
+                    Metrics.IncShareAccepted(0);
+                    _log.LogWarning(
+                        "============================================================");
+                    _log.LogWarning(
+                        " LUCKYPOOL SHARE ACCEPTED  job={Job} requestId={Id} hash={Hash}",
+                        externalJobId,
+                        result.RequestId,
+                        hashPrefix);
+                    _log.LogWarning(
+                        "============================================================");
+                }
+                else
+                {
+                    Metrics.IncShareRejected(0);
+                    _log.LogWarning(
+                        "LUCKYPOOL SHARE REJECTED job={Job} requestId={Id} hash={Hash} result={Result} error={Error}",
+                        externalJobId,
+                        result.RequestId,
+                        hashPrefix,
+                        result.ResultJson,
+                        result.ErrorJson ?? "(none)");
+                }
+
+                _completion.TrySetResult(result);
+            }
+            catch (Exception ex)
+            {
+                _completion.TrySetException(ex);
+                _log.LogError(ex,
+                    "LUCKYPOOL SUBMIT-TEST: mining.submit failed job={Job} hash={Hash}",
+                    externalJobId,
+                    hashPrefix);
+                throw;
+            }
+            finally
+            {
+                _stopAfterResponse();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Terminal sink used only by luckypool-mine-test. Receiving a call here
+    /// proves the GPU trigger + proof-finalization pipeline completed, but the
+    /// candidate is deliberately discarded. There is no network submit path.
+    /// </summary>
+    private sealed class LuckyPoolDryRunShareSink : IPlainProofSink
+    {
+        private readonly ILogger _log;
+        private long _count;
+
+        public LuckyPoolDryRunShareSink(ILogger log)
+        {
+            _log = log;
+        }
+
+        public ValueTask SubmitAsync(ShareSubmission share, CancellationToken ct)
+        {
+            _ = share;
+            _ = ct;
+            throw new InvalidOperationException(
+                "LuckyPool dry-run requires PlainProof; protobuf ShareSubmission fallback is disabled.");
+        }
+
+        public ValueTask SubmitPlainProofAsync(
+            string externalJobId,
+            string plainProofBase64,
+            int plainProofBytes,
+            ShareSubmission share,
+            CancellationToken ct)
+        {
+            _ = ct;
+
+            var count = Interlocked.Increment(ref _count);
+            var hashPrefix = share.ClaimedHash.Length > 0
+                ? Convert.ToHexString(share.ClaimedHash.Span[..Math.Min(8, share.ClaimedHash.Length)])
+                : "-";
+
+            _log.LogWarning(
+                "LUCKYPOOL DRY-RUN: PlainProof VALID candidate #{Count} job={Job} proofBytes={Bytes} base64Chars={Chars} hash={Hash} — NOT SUBMITTED",
+                count,
+                externalJobId,
+                plainProofBytes,
+                plainProofBase64.Length,
+                hashPrefix);
+
+            return ValueTask.CompletedTask;
+        }
+    }
 
     private sealed class MiningSessionShareSink : IShareSink
     {

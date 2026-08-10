@@ -9,6 +9,10 @@
 // (AKOYA_POOL_RECONNECT_*, AKOYA_POOL_FIRST_JOB_*, AKOYA_POOL_SHARE_STARVATION_*,
 // AKOYA_GATEWAY_*). Those still parse from the environment but only produce
 // a deprecation warning — see EnvVarBindings.WarnOnDeprecated.
+//
+// LuckyPool-specific connection settings intentionally remain outside this
+// aggregate for now. The experimental Stratum commands read LUCKYPOOL_* vars
+// directly, while this type continues to own the shared GPU/mining settings.
 
 namespace Akoya.Miner.Config;
 
