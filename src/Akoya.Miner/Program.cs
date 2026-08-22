@@ -1,4 +1,4 @@
-// Akoya.Miner v2
+// Akoya.Miner — Akoya V2 + Pearl V3/LuckyPool compatibility
 //
 // Subcommands:
 //   mine-blocks               Connect to Akoya V2 pool, register/resume, mine.
@@ -1011,7 +1011,7 @@ static async Task<int> MineBlocksAsync(string[] _)
 static int PrintVersion()
 {
     Console.WriteLine($"akoya-miner v{VersionInfo.MinerVersion} (git {VersionInfo.GitSha})");
-    Console.WriteLine("V2 gRPC miner + LuckyPool Stratum mining support");
+    Console.WriteLine("Akoya V2 gRPC + Pearl V3/LuckyPool Stratum mining support");
     return 0;
 }
 
@@ -1072,6 +1072,33 @@ static async Task<int> SelfTestAsync(string[] _)
     {
         NativeLibrary.Free(NativeLibs.Load("AKOYA_PEARL_GEMM_LIB", NativeLibs.GemmFile));
         return Environment.GetEnvironmentVariable("AKOYA_PEARL_GEMM_LIB") ?? $"{NativeLibs.GemmFile} (resolved)";
+    }));
+
+    probes.Add(RunProbe("pearl_gemm_abi", () =>
+    {
+        const int requiredAbi = 3;
+        int abi = PearlGemmNative.AbiVersion();
+        if (abi != requiredAbi)
+            throw new InvalidOperationException($"pearl-gemm CAPI ABI {abi} != required {requiredAbi}; rebuild native V3 library");
+        return $"abi={abi}";
+    }));
+
+    probes.Add(RunProbe("v3_seed_vector", () =>
+    {
+        byte[] jobKey = Enumerable.Repeat((byte)0x11, 32).ToArray();
+        byte[] hashA = Enumerable.Repeat((byte)0xAA, 32).ToArray();
+        byte[] hashB = Enumerable.Repeat((byte)0xBB, 32).ToArray();
+        var (bSeed, aSeed) = Akoya.Crypto.CommitmentHasher.DeriveNoiseSeeds(
+            jobKey, hashA, hashB, m: 192, n: 320, useSaltedSeeds: true);
+
+        const string expectedB = "60ED9B73C5A9599B200B6CD563E7F0D5D9A67D2402D85FD4EF966C580080D0E5";
+        const string expectedA = "301784168005EC833AB0AA60006F7FE7FAAA95307D8C1FC6819B2FFDD717ECCF";
+        string actualB = Convert.ToHexString(bSeed);
+        string actualA = Convert.ToHexString(aSeed);
+        if (actualB != expectedB || actualA != expectedA)
+            throw new InvalidOperationException($"V3 seed vector mismatch: B={actualB} A={actualA}");
+
+        return $"B={actualB[..8]}… A={actualA[..8]}…";
     }));
 
     probes.Add(RunProbe("pearl_mining_lib", () =>

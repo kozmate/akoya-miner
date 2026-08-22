@@ -1672,6 +1672,27 @@ internal sealed class WorkerOrchestrator : IAsyncDisposable
 
     private static void EnsureNativeGemmSupportsGpus(IReadOnlyList<GpuInfo> gpus)
     {
+        const int RequiredPearlCapiAbi = 3;
+        int abi;
+        try
+        {
+            abi = PearlGemmNative.AbiVersion();
+        }
+        catch (EntryPointNotFoundException ex)
+        {
+            throw new InvalidOperationException(
+                "Loaded pearl-gemm CAPI library does not expose ABI-version reporting. "
+                + "Rebuild libpearl_gemm_capi.so from this miner source tree.",
+                ex);
+        }
+
+        if (abi != RequiredPearlCapiAbi)
+        {
+            throw new InvalidOperationException(
+                $"Loaded pearl-gemm CAPI ABI {abi} does not match required ABI {RequiredPearlCapiAbi}. "
+                + "Rebuild libpearl_gemm_capi.so together with the V3 miner; mixing old/new CAPI binaries is unsafe.");
+        }
+
         string profile;
         try
         {

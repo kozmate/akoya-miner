@@ -38,6 +38,7 @@
 #include <cuda_runtime.h>
 
 #include <cute/atom/mma_atom.hpp>
+#include <cute/atom/mma_traits_sm90_gmma.hpp>
 #include <cute/atom/copy_atom.hpp>
 #include <cute/arch/copy_sm90_tma.hpp>
 #include <cute/atom/copy_traits_sm90_tma.hpp>
@@ -80,6 +81,62 @@ using namespace cute;
 #error "PEARL_CONSUMER_MANUAL_IMMA must be 0 or 1"
 #endif
 
+// Experimental register/SMEM-pressure reduction for consumer Blackwell.
+// The proof/output tile remains the canonical 128x256 tile, but the GEMM is
+// evaluated as four 128x64 N-strips.  Each strip carries only 1/4 of the C
+// accumulator fragment and B shared-memory tile.  Transcript combination is
+// exact because both XOR and rotl() are linear over XOR:
+//   chain(H0 xor H1 ...) == chain(H0) xor chain(H1) ...
+// when every chain starts at zero and uses the same snapshot cadence.
+#ifndef PEARL_CONSUMER_N64_STRIPMINE
+#define PEARL_CONSUMER_N64_STRIPMINE 0
+#endif
+#if PEARL_CONSUMER_N64_STRIPMINE != 0 && PEARL_CONSUMER_N64_STRIPMINE != 1
+#error "PEARL_CONSUMER_N64_STRIPMINE must be 0 or 1"
+#endif
+#if PEARL_CONSUMER_N64_STRIPMINE && !PEARL_CONSUMER_MANUAL_IMMA
+#error "PEARL_CONSUMER_N64_STRIPMINE requires PEARL_CONSUMER_MANUAL_IMMA=1"
+#endif
+#if PEARL_CONSUMER_N64_STRIPMINE && PEARL_CONSUMER_USE_TMA_EXPERIMENT
+#error "PEARL_CONSUMER_N64_STRIPMINE currently supports cp.async only"
+#endif
+
+// Experimental instruction-level pipeline for the canonical 128x256 manual
+// IMMA path.  Keep two kAtomK=32 A/B register-fragment sets live so the
+// ldmatrix loads for the next slice can execute while the dependent mma.sync
+// accumulator chain from the current slice is still settling.  Unlike the N64
+// experiment this preserves the original A reuse, SMEM footprint, proof tile,
+// and single K-loop; the only intentional trade-off is a modest register
+// increase for more independent work between dependent MMA instructions.
+#ifndef PEARL_CONSUMER_IMMA_PREFETCH
+#define PEARL_CONSUMER_IMMA_PREFETCH 0
+#endif
+#if PEARL_CONSUMER_IMMA_PREFETCH != 0 && PEARL_CONSUMER_IMMA_PREFETCH != 1
+#error "PEARL_CONSUMER_IMMA_PREFETCH must be 0 or 1"
+#endif
+#if PEARL_CONSUMER_IMMA_PREFETCH && !PEARL_CONSUMER_MANUAL_IMMA
+#error "PEARL_CONSUMER_IMMA_PREFETCH requires PEARL_CONSUMER_MANUAL_IMMA=1"
+#endif
+#if PEARL_CONSUMER_IMMA_PREFETCH && PEARL_CONSUMER_N64_STRIPMINE
+#error "PEARL_CONSUMER_IMMA_PREFETCH and PEARL_CONSUMER_N64_STRIPMINE are mutually exclusive"
+#endif
+
+// Experimental Blackwell shared-memory layout using CUTLASS/CuTe's canonical
+// K-major SW128 atom for 8-bit operands.  For int8 this atom is 8x128 with
+// Swizzle<3,4,3>; the previous hand-written layout used a 16x128 atom.  The
+// logical A/B tensors and all MMA/proof coordinates stay unchanged -- only
+// their physical shared-memory permutation changes.  Both cp.async writes and
+// ldmatrix reads are derived from the same layout, preserving byte identity.
+#ifndef PEARL_CONSUMER_SMEM_K_SW128
+#define PEARL_CONSUMER_SMEM_K_SW128 0
+#endif
+#if PEARL_CONSUMER_SMEM_K_SW128 != 0 && PEARL_CONSUMER_SMEM_K_SW128 != 1
+#error "PEARL_CONSUMER_SMEM_K_SW128 must be 0 or 1"
+#endif
+#if PEARL_CONSUMER_SMEM_K_SW128 && PEARL_CONSUMER_N64_STRIPMINE
+#error "PEARL_CONSUMER_SMEM_K_SW128 experiment is for the canonical N=256 path"
+#endif
+
 // ─── Shape constants (must match transcript_kernel.cu) ───────────────────────
 #ifndef PEARL_CONSUMER_BM
 #define PEARL_CONSUMER_BM 128
@@ -95,6 +152,9 @@ using namespace cute;
 #endif
 static constexpr int kBM = PEARL_CONSUMER_BM;
 static constexpr int kBN = PEARL_CONSUMER_BN;
+static constexpr int kComputeBN = PEARL_CONSUMER_N64_STRIPMINE ? 64 : kBN;
+static constexpr int kNStrips = kBN / kComputeBN;
+static_assert(kBN % kComputeBN == 0, "compute N-strip must divide canonical BN");
 static constexpr int kAtomK = 32;                     // mma.sync m16n8k32 K
 #ifndef PEARL_CONSUMER_KBLOCK
 #define PEARL_CONSUMER_KBLOCK PEARL_CONSUMER_DEFAULT_KBLOCK
@@ -115,9 +175,17 @@ static constexpr int kThreads = kProofThreads + 32;   // 8 consumer warps + 1 TM
 #else
 static constexpr int kThreads = kProofThreads;        // 8 warps
 #endif
-static constexpr int kFragSize = (kBM * kBN) / kProofThreads; // per-thread acc slots
+static constexpr int kFragSize = (kBM * kBN) / kProofThreads; // canonical per-thread slots
+static constexpr int kComputeFragSize =
+    (kBM * kComputeBN) / kProofThreads;               // live C fragment in compute tile
 static_assert((kBM * kBN) % kProofThreads == 0,
               "CTA tile must divide evenly across 256 threads");
+static_assert((kBM * kComputeBN) % kProofThreads == 0,
+              "compute tile must divide evenly across 256 threads");
+#if PEARL_CONSUMER_N64_STRIPMINE
+static_assert(kComputeBN == 64 && kComputeFragSize == 32 && kNStrips == 4,
+              "N64 strip-mined path is specialized for four 128x64 strips");
+#endif
 static constexpr int kTranscriptSlots = 16;           // = MSG_BLOCK_SIZE_U32
 
 using ElementIn  = int8_t;
@@ -238,14 +306,48 @@ CUTLASS_DEVICE uint32_t xor_reduction_frag128(const TensorType& input_tensor) {
 #endif
 }
 
+#if PEARL_CONSUMER_N64_STRIPMINE
+template <typename TensorType>
+CUTLASS_DEVICE uint32_t xor_reduction_frag32(const TensorType& input_tensor) {
+  static_assert(kComputeFragSize == 32,
+                "N64 strip transcript XOR is specialized for 32 slots");
+
+  // Four independent lop3 chains keep the dependency depth short while the
+  // live C fragment is only 32 int32 values.  XOR order is proof-irrelevant.
+  uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < kComputeFragSize; i += 8) {
+    a0 = pearl::xor3_lop3(a0, static_cast<uint32_t>(input_tensor[i + 0]),
+                          static_cast<uint32_t>(input_tensor[i + 4]));
+    a1 = pearl::xor3_lop3(a1, static_cast<uint32_t>(input_tensor[i + 1]),
+                          static_cast<uint32_t>(input_tensor[i + 5]));
+    a2 = pearl::xor3_lop3(a2, static_cast<uint32_t>(input_tensor[i + 2]),
+                          static_cast<uint32_t>(input_tensor[i + 6]));
+    a3 = pearl::xor3_lop3(a3, static_cast<uint32_t>(input_tensor[i + 3]),
+                          static_cast<uint32_t>(input_tensor[i + 7]));
+  }
+  uint32_t r0 = pearl::xor3_lop3(a0, a1, a2);
+  return pearl::xor3_lop3(r0, a3, 0);
+}
+#endif
+
 // Sm80 TiledMMA — verified byte-identical partition_C with WGMMA via
 // probe_sm80_layout.cu.  The Tile<> argument's K dim is the MMA *atom* K
 // (= 32), NOT the smem kBK.  partition_A/_B/partition_fragment_A/_B then
 // produce MMA_K = kBK / kAtomK fragments per smem stage.
-using Sm80TiledMma = TiledMMA<
+using Sm80CanonicalTiledMma = TiledMMA<
     MMA_Atom<SM80_16x8x32_S32S8S8S32_TN>,
     Layout<Shape<_8, _1, _1>>,
     Tile<Int<kBM>, Int<kBN>, Int<kAtomK>>>;
+
+// Compute MMA may use a narrower N tile while the canonical proof tile stays
+// 128x256.  With N64 strip-mining, each thread owns 32 C accumulators instead
+// of 128, while the 8-warp M decomposition (and therefore proof lane identity)
+// is unchanged.
+using Sm80TiledMma = TiledMMA<
+    MMA_Atom<SM80_16x8x32_S32S8S8S32_TN>,
+    Layout<Shape<_8, _1, _1>>,
+    Tile<Int<kBM>, Int<kComputeBN>, Int<kAtomK>>>;
 
 // ─── SMEM layout (Swizzle<2|3,4,3> for bank-conflict-free LDSM.x4) ───────────
 // kBK=64/128 bytes per row gives each ldmatrix.x4 lane-group access a clean
@@ -266,8 +368,8 @@ using Sm80TiledMma = TiledMMA<
 #endif
 //
 // A: (kBM=128, kBK=128) int8 = 16 KiB per stage.
-// B: (kBN=256, kBK=128) int8 = 32 KiB per stage.
-// Total smem/block = (kBM + kBN) * kBK * kStages bytes. Stage count, tile
+// B: default 256x128 = 32 KiB/stage; N64 strip path = 64x128 = 8 KiB/stage.
+// Total smem/block = (kBM + kComputeBN) * kBK * kStages bytes. Stage count, tile
 // shape, swizzle, and launch-bounds minBlocks are compile-time knobs because
 // the fastest point differs by SKU.
 #ifndef PEARL_CONSUMER_STAGES
@@ -278,17 +380,26 @@ using Sm80TiledMma = TiledMMA<
 #endif
 static constexpr int kStages = PEARL_CONSUMER_STAGES;
 
+#if PEARL_CONSUMER_SMEM_K_SW128
+static_assert(kBK == 128,
+              "canonical K_SW128 experiment requires kBK=128");
+static_assert(sizeof(ElementIn) == 1,
+              "canonical K_SW128 experiment is specialized for int8");
+using SmemLayoutAtomA = GMMA::Layout_K_SW128_Atom<ElementIn>;
+using SmemLayoutAtomB = GMMA::Layout_K_SW128_Atom<ElementIn>;
+#else
 using SmemLayoutAtomA = decltype(composition(
     Swizzle<PEARL_CONSUMER_SWIZZLE_BITS, 4, 3>{},
     Layout<Shape<_16, Int<kBK>>, Stride<Int<kBK>, _1>>{}));
 using SmemLayoutAtomB = SmemLayoutAtomA;  // same atom shape works for B
+#endif
 
 using SmemLayoutA = decltype(tile_to_shape(
     SmemLayoutAtomA{},
     make_shape(Int<kBM>{}, Int<kBK>{}, Int<kStages>{})));
 using SmemLayoutB = decltype(tile_to_shape(
     SmemLayoutAtomB{},
-    make_shape(Int<kBN>{}, Int<kBK>{}, Int<kStages>{})));
+    make_shape(Int<kComputeBN>{}, Int<kBK>{}, Int<kStages>{})));
 
 #if PEARL_CONSUMER_USE_TMA_EXPERIMENT
 using SmemLayoutStageA = decltype(tile_to_shape(
@@ -296,7 +407,7 @@ using SmemLayoutStageA = decltype(tile_to_shape(
     make_shape(Int<kBM>{}, Int<kBK>{})));
 using SmemLayoutStageB = decltype(tile_to_shape(
     SmemLayoutAtomB{},
-    make_shape(Int<kBN>{}, Int<kBK>{})));
+    make_shape(Int<kComputeBN>{}, Int<kBK>{})));
 using GmemLayout2D = decltype(make_layout(
     make_shape(int(0), int(0)), make_stride(int(0), _1{})));
 using GmemTensor2D = decltype(make_tensor(
@@ -306,7 +417,7 @@ using TmaA = decltype(make_tma_copy(
 using TmaB = decltype(make_tma_copy(
     SM90_TMA_LOAD{}, GmemTensor2D{}, SmemLayoutStageB{}));
 static constexpr uint32_t kTmaBytes =
-    (uint32_t)(kBM * kBK + kBN * kBK) * (uint32_t)sizeof(ElementIn);
+    (uint32_t)(kBM * kBK + kComputeBN * kBK) * (uint32_t)sizeof(ElementIn);
 #endif
 
 struct SharedStorage {
@@ -392,8 +503,10 @@ __global__ void transcript_gemm_kernel_consumer(
 
   Tensor gA = local_tile(mA, Shape<Int<kBM>, Int<kBK>>{},
                          make_coord(m_tile, _));   // (kBM, kBK, K/kBK)
+#if !PEARL_CONSUMER_N64_STRIPMINE
   Tensor gB = local_tile(mB, Shape<Int<kBN>, Int<kBK>>{},
                          make_coord(n_tile, _));   // (kBN, kBK, K/kBK)
+#endif
 
   const int K_TILES = K / kBK;
   const int reduce_every_k = R / kBK;       // R=128: kBK=128 → 1
@@ -463,14 +576,16 @@ __global__ void transcript_gemm_kernel_consumer(
   auto g2s_thr_copy_b = g2s_copy_b.get_slice(tid);
   Tensor tAgA = g2s_thr_copy_a.partition_S(gA);   // (CPY, REST_M, REST_K, K_TILES)
   Tensor tAsA = g2s_thr_copy_a.partition_D(sA);   // (CPY, REST_M, REST_K, kStages)
-  Tensor tBgB = g2s_thr_copy_b.partition_S(gB);   // (CPY, REST_M, REST_K, K_TILES)
   Tensor tBsB = g2s_thr_copy_b.partition_D(sB);   // (CPY, REST_M, REST_K, kStages)
+#if !PEARL_CONSUMER_N64_STRIPMINE
+  Tensor tBgB = g2s_thr_copy_b.partition_S(gB);   // (CPY, REST_M, REST_K, K_TILES)
 
   auto issue_load = [&](int k_iter, int stg) {
     copy(g2s_copy_a, tAgA(_, _, _, k_iter), tAsA(_, _, _, stg));
     copy(g2s_copy_b, tBgB(_, _, _, k_iter), tBsB(_, _, _, stg));
     asm volatile("cp.async.commit_group;\n");
   };
+#endif
 #endif
 
 #if PEARL_CONSUMER_USE_TMA_EXPERIMENT
@@ -488,6 +603,214 @@ __global__ void transcript_gemm_kernel_consumer(
   }
 #endif
 
+#if PEARL_CONSUMER_N64_STRIPMINE
+  // ── N64 strip-mined SM120 path ─────────────────────────────────────────
+  // Keep the canonical grid/proof tile at 128x256, but evaluate four N=64
+  // strips sequentially.  This trades re-reading A from L2 for a 4x smaller
+  // C fragment and 4x smaller B SMEM footprint.  The intended payoff is two
+  // resident CTAs/SM instead of one, giving the scheduler 16 warps to hide
+  // ldmatrix/mma dependency latency.
+  Sm80TiledMma tiled_mma;
+  auto thr_mma = tiled_mma.get_thread_slice(tid);
+
+  Tensor cD_compute =
+      make_identity_tensor(Shape<Int<kBM>, Int<kComputeBN>>{});
+  Tensor tCcD_compute = thr_mma.partition_C(cD_compute);
+  static_assert(decltype(size(tCcD_compute))::value == kComputeFragSize,
+                "N64 compute fragment must contain 32 int32 slots/thread");
+
+  auto s2r_copy_a = make_tiled_copy_A(
+      Copy_Atom<SM75_U32x4_LDSM_N, ElementIn>{}, tiled_mma);
+  auto s2r_thr_copy_a = s2r_copy_a.get_slice(tid);
+  auto s2r_copy_b = make_tiled_copy_B(
+      Copy_Atom<SM75_U32x4_LDSM_N, ElementIn>{}, tiled_mma);
+  auto s2r_thr_copy_b = s2r_copy_b.get_slice(tid);
+
+  // Final canonical transcript for this 128x256 tile.  A strip's complete
+  // rotl_xor chain is XORed into this array.  Since rotl distributes over
+  // XOR and every strip chain starts from zero, this is byte-identical to
+  // chaining the XOR of all four strip hashes at every snapshot.
+  uint32_t transcript_local[kTranscriptSlots];
+  CUTLASS_PRAGMA_UNROLL
+  for (int s = 0; s < kTranscriptSlots; ++s) transcript_local[s] = 0;
+
+  // Keep one physical mainloop body in the cubin.  Unrolling four complete K
+  // loops bloats instruction footprint without increasing cross-strip ILP (the
+  // strips are intentionally sequential so only one 32-int C fragment is live).
+  CUTLASS_PRAGMA_NO_UNROLL
+  for (int strip = 0; strip < kNStrips; ++strip) {
+    Tensor tCrC = make_tensor<ElementAcc>(Shape<Int<kComputeFragSize>>{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int j = 0; j < kComputeFragSize; ++j) tCrC(j) = 0;
+
+    uint32_t strip_transcript[kTranscriptSlots];
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < kTranscriptSlots; ++s) strip_transcript[s] = 0;
+
+    Tensor gB_strip = local_tile(
+        mB, Shape<Int<kComputeBN>, Int<kBK>>{},
+        make_coord(n_tile * kNStrips + strip, _));
+    Tensor tBgB = g2s_thr_copy_b.partition_S(gB_strip);
+
+    auto issue_load_strip = [&](int k_iter, int stg) {
+      copy(g2s_copy_a, tAgA(_, _, _, k_iter), tAsA(_, _, _, stg));
+      copy(g2s_copy_b, tBgB(_, _, _, k_iter), tBsB(_, _, _, stg));
+      asm volatile("cp.async.commit_group;\n");
+    };
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < kStages - 1; ++s) {
+      if (s < K_TILES) issue_load_strip(s, s);
+    }
+
+    for (int k_iter = 0; k_iter < K_TILES; ++k_iter) {
+      const int stg = k_iter % kStages;
+
+      asm volatile("cp.async.wait_group %0;\n" :: "n"(kStages - 2));
+      __syncthreads();
+
+      const int next_k = k_iter + kStages - 1;
+      if (next_k < K_TILES) {
+        issue_load_strip(next_k, next_k % kStages);
+      } else {
+        asm volatile("cp.async.commit_group;\n");
+      }
+
+      if (k_iter > 0 && (k_iter % reduce_every_k) == 0) {
+        const uint32_t hash = xor_reduction_frag32(tCrC);
+        const int snapshot_idx = (k_iter / reduce_every_k) - 1;
+        const int slot = snapshot_idx % kTranscriptSlots;
+        strip_transcript[slot] =
+            pearl::rotl_xor<pearl::HASH_ACCUMULATE_ROTATION>(
+                strip_transcript[slot], hash);
+      }
+
+      Tensor sA_stg = sA(_, _, stg);
+      Tensor sB_stg = sB(_, _, stg);
+      auto tCrC_view = make_tensor(
+          tCrC.data(),
+          thr_mma.partition_fragment_C(
+              make_tensor<ElementAcc>(
+                  Shape<Int<kBM>, Int<kComputeBN>>{})).layout());
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int kb = 0; kb < kMmaKBlocks; ++kb) {
+        Tensor sA_k = local_tile(
+            sA_stg, Shape<Int<kBM>, Int<kAtomK>>{},
+            make_coord(_0{}, kb));
+        Tensor sB_k = local_tile(
+            sB_stg, Shape<Int<kComputeBN>, Int<kAtomK>>{},
+            make_coord(_0{}, kb));
+        Tensor tCrA = thr_mma.partition_fragment_A(sA_k);
+        Tensor tCrB = thr_mma.partition_fragment_B(sB_k);
+
+        auto tXsA = s2r_thr_copy_a.partition_S(sA_k);
+        auto tXrA = s2r_thr_copy_a.retile_D(tCrA);
+        copy(s2r_copy_a, tXsA, tXrA);
+
+        auto tXsB = s2r_thr_copy_b.partition_S(sB_k);
+        auto tXrB = s2r_thr_copy_b.retile_D(tCrB);
+        copy(s2r_copy_b, tXsB, tXrB);
+
+        gemm(tiled_mma, tCrA, tCrB, tCrC_view);
+      }
+    }
+
+    if ((K_TILES % reduce_every_k) == 0) {
+      const uint32_t hash = xor_reduction_frag32(tCrC);
+      const int snapshot_idx = (K_TILES / reduce_every_k) - 1;
+      const int slot = snapshot_idx % kTranscriptSlots;
+      strip_transcript[slot] =
+          pearl::rotl_xor<pearl::HASH_ACCUMULATE_ROTATION>(
+              strip_transcript[slot], hash);
+    }
+
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < kTranscriptSlots; ++s) {
+      transcript_local[s] ^= strip_transcript[s];
+    }
+
+    // Preserve the generic C-output ABI. Mining normally passes C_gmem=null,
+    // but torch/debug callers still receive the exact canonical 128x256 tile.
+    if constexpr (!kHeadless) {
+      if (C_gmem != nullptr) {
+        const int64_t c_base =
+            (int64_t)batch * M * N
+            + (int64_t)m_tile * kBM * (int64_t)N
+            + (int64_t)n_tile * kBN
+            + (int64_t)strip * kComputeBN;
+        CUTLASS_PRAGMA_UNROLL
+        for (int j = 0; j < kComputeFragSize; ++j) {
+          const int m = get<0>(tCcD_compute(j));
+          const int n = get<1>(tCcD_compute(j));
+          C_gmem[c_base + (int64_t)m * N + n] = tCrC(j);
+        }
+      }
+    }
+
+    // Before the next strip starts overwriting the two-stage A/B buffers,
+    // drain all cp.async groups and make sure every warp has finished reading
+    // this strip's final stage.
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+  }
+
+  // Canonical in-kernel proof finalization.  Transcript lanes remain the
+  // original 256-thread 128x256 mapping; only the internal compute tile changed.
+  if constexpr (kHeadless) {
+    Tensor transcript_rmem =
+        make_tensor<uint32_t>(Int<kTranscriptSlots>{});
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < kTranscriptSlots; ++s)
+      transcript_rmem(s) = transcript_local[s];
+
+    const bool block_found =
+        pearl::check_pow_target(transcript_rmem, pow_target, pow_key);
+    if (block_found) {
+      auto block_coord = cute::make_tuple(
+          (int32_t)m_tile, (int32_t)n_tile, (int32_t)batch);
+      auto problem_shape = cute::make_tuple(M, N, K, R);
+      pearl::write_host_signal_header<
+          Sm80CanonicalTiledMma, HeaderTileShape_MNK>(
+          host_signal_sync, host_signal_header_pinned,
+          problem_shape, block_coord, tid, pow_target);
+    }
+  } else {
+    if (pow_target != nullptr && pow_key != nullptr &&
+        host_signal_sync != nullptr && host_signal_header_pinned != nullptr) {
+      Tensor transcript_rmem =
+          make_tensor<uint32_t>(Int<kTranscriptSlots>{});
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < kTranscriptSlots; ++s)
+        transcript_rmem(s) = transcript_local[s];
+
+      const bool block_found =
+          pearl::check_pow_target(transcript_rmem, pow_target, pow_key);
+      if (block_found) {
+        auto block_coord = cute::make_tuple(
+            (int32_t)m_tile, (int32_t)n_tile, (int32_t)batch);
+        auto problem_shape = cute::make_tuple(M, N, K, R);
+        pearl::write_host_signal_header<
+            Sm80CanonicalTiledMma, HeaderTileShape_MNK>(
+            host_signal_sync, host_signal_header_pinned,
+            problem_shape, block_coord, tid, pow_target);
+      }
+    }
+  }
+
+  if constexpr (!kHeadless) {
+    if (transcript != nullptr) {
+      const int64_t base =
+          ((int64_t)batch * num_m_tiles + m_tile) * num_n_tiles + n_tile;
+      const int64_t tx_off =
+          base * (int64_t)kProofThreads * kTranscriptSlots
+          + (int64_t)tid * kTranscriptSlots;
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < kTranscriptSlots; ++s)
+        transcript[tx_off + s] = transcript_local[s];
+    }
+  }
+#else
   // Per-thread accumulator (128 int32 in registers).  In TMA mode only the
   // first 256 threads reach here; the extra warp is a pure producer.
   Sm80TiledMma tiled_mma;
@@ -578,6 +901,76 @@ __global__ void transcript_gemm_kernel_consumer(
         Copy_Atom<SM75_U32x4_LDSM_N, ElementIn>{}, tiled_mma);
     auto s2r_thr_copy_b = s2r_copy_b.get_slice(tid);
 
+#if PEARL_CONSUMER_IMMA_PREFETCH
+    // The A-V3 control uses kBK=128, hence four m16n8k32 slices per SMEM
+    // stage.  Specialize the experimental software pipeline to that exact
+    // control shape so there is no dynamic buffer selector or branch in the
+    // generated hot loop.
+    static_assert(kMmaKBlocks == 4,
+                  "IMMA prefetch experiment requires kBK=128 (4 x kAtomK)");
+
+    Tensor sA_k0 = local_tile(sA_stg, Shape<Int<kBM>, Int<kAtomK>>{},
+                              make_coord(_0{}, 0));
+    Tensor sB_k0 = local_tile(sB_stg, Shape<Int<kBN>, Int<kAtomK>>{},
+                              make_coord(_0{}, 0));
+    Tensor tCrA0 = thr_mma.partition_fragment_A(sA_k0);
+    Tensor tCrB0 = thr_mma.partition_fragment_B(sB_k0);
+    Tensor tCrA1 = make_fragment_like(tCrA0);
+    Tensor tCrB1 = make_fragment_like(tCrB0);
+
+    auto tXsA0 = s2r_thr_copy_a.partition_S(sA_k0);
+    auto tXrA0 = s2r_thr_copy_a.retile_D(tCrA0);
+    copy(s2r_copy_a, tXsA0, tXrA0);
+    auto tXsB0 = s2r_thr_copy_b.partition_S(sB_k0);
+    auto tXrB0 = s2r_thr_copy_b.retile_D(tCrB0);
+    copy(s2r_copy_b, tXsB0, tXrB0);
+
+    // Preload slice 1 into the second operand buffer before issuing MMA 0.
+    // MMA 0 does not depend on these loads, so the warp has independent MIO
+    // work available ahead of the dependent accumulator chain.
+    Tensor sA_k1 = local_tile(sA_stg, Shape<Int<kBM>, Int<kAtomK>>{},
+                              make_coord(_0{}, 1));
+    Tensor sB_k1 = local_tile(sB_stg, Shape<Int<kBN>, Int<kAtomK>>{},
+                              make_coord(_0{}, 1));
+    auto tXsA1 = s2r_thr_copy_a.partition_S(sA_k1);
+    auto tXrA1 = s2r_thr_copy_a.retile_D(tCrA1);
+    copy(s2r_copy_a, tXsA1, tXrA1);
+    auto tXsB1 = s2r_thr_copy_b.partition_S(sB_k1);
+    auto tXrB1 = s2r_thr_copy_b.retile_D(tCrB1);
+    copy(s2r_copy_b, tXsB1, tXrB1);
+
+    gemm(tiled_mma, tCrA0, tCrB0, tCrC_view);
+
+    // Buffer 0 is dead as soon as MMA 0 has consumed it.  Refill it with
+    // slice 2 while the accumulator dependency from MMA 0 -> MMA 1 is live.
+    Tensor sA_k2 = local_tile(sA_stg, Shape<Int<kBM>, Int<kAtomK>>{},
+                              make_coord(_0{}, 2));
+    Tensor sB_k2 = local_tile(sB_stg, Shape<Int<kBN>, Int<kAtomK>>{},
+                              make_coord(_0{}, 2));
+    auto tXsA2 = s2r_thr_copy_a.partition_S(sA_k2);
+    auto tXrA2 = s2r_thr_copy_a.retile_D(tCrA0);
+    copy(s2r_copy_a, tXsA2, tXrA2);
+    auto tXsB2 = s2r_thr_copy_b.partition_S(sB_k2);
+    auto tXrB2 = s2r_thr_copy_b.retile_D(tCrB0);
+    copy(s2r_copy_b, tXsB2, tXrB2);
+
+    gemm(tiled_mma, tCrA1, tCrB1, tCrC_view);
+
+    // Same ping-pong for slice 3.
+    Tensor sA_k3 = local_tile(sA_stg, Shape<Int<kBM>, Int<kAtomK>>{},
+                              make_coord(_0{}, 3));
+    Tensor sB_k3 = local_tile(sB_stg, Shape<Int<kBN>, Int<kAtomK>>{},
+                              make_coord(_0{}, 3));
+    auto tXsA3 = s2r_thr_copy_a.partition_S(sA_k3);
+    auto tXrA3 = s2r_thr_copy_a.retile_D(tCrA1);
+    copy(s2r_copy_a, tXsA3, tXrA3);
+    auto tXsB3 = s2r_thr_copy_b.partition_S(sB_k3);
+    auto tXrB3 = s2r_thr_copy_b.retile_D(tCrB1);
+    copy(s2r_copy_b, tXsB3, tXrB3);
+
+    gemm(tiled_mma, tCrA0, tCrB0, tCrC_view);
+    gemm(tiled_mma, tCrA1, tCrB1, tCrC_view);
+#else
     CUTLASS_PRAGMA_UNROLL
     for (int kb = 0; kb < kMmaKBlocks; ++kb) {
       Tensor sA_k = local_tile(sA_stg, Shape<Int<kBM>, Int<kAtomK>>{},
@@ -597,6 +990,7 @@ __global__ void transcript_gemm_kernel_consumer(
 
       gemm(tiled_mma, tCrA, tCrB, tCrC_view);
     }
+#endif
 
 #if PEARL_CONSUMER_USE_TMA_EXPERIMENT
     if ((tid & 31) == 0) {
@@ -753,6 +1147,7 @@ __global__ void transcript_gemm_kernel_consumer(
       }
     }
   }
+#endif  // PEARL_CONSUMER_N64_STRIPMINE
 
 }
 

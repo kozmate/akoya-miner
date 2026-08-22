@@ -98,6 +98,7 @@ public static partial class PearlGemmNative
         nint aMerkleRoot, nint bMerkleRoot,
         nint key,
         nint aCommitmentHash, nint bCommitmentHash,
+        int useSaltedSeeds, uint saltedDimA, uint saltedDimB,
         int deviceId,
         nint stream);
 
@@ -129,6 +130,7 @@ public static partial class PearlGemmNative
     public struct InstallBParams
     {
         public int M, N, K, R;
+        public int UseSaltedSeeds;
         public int ExpandBSeed;
         public uint ThNumBlocks;
         public uint ThThreads;
@@ -223,6 +225,7 @@ public static partial class PearlGemmNative
     {
         // Dimensions
         public int M, N, K, R;
+        public int UseSaltedSeeds;
         public int BM, BN, BK, CM, CN;
 
         // TensorHash constants (= TENSOR_HASH_THREADS/STAGES/LEAVES)

@@ -131,7 +131,7 @@ float elapsed_event_ms(cudaEvent_t start, cudaEvent_t stop) {
 #endif
 extern "C" {
 
-PEARL_CAPI_EXPORT int pearl_capi_abi_version(void) { return 2; }
+PEARL_CAPI_EXPORT int pearl_capi_abi_version(void) { return 3; }
 
 PEARL_CAPI_EXPORT const char* pearl_capi_build_profile(void) {
 #if defined(PEARL_GEMM_VOLTA)
@@ -311,6 +311,9 @@ PEARL_CAPI_EXPORT int pearl_capi_commitment_hash_from_merkle_roots(
                                                   const uint8_t* key,
                                                   uint8_t* A_commitment_hash,
                                                   uint8_t* B_commitment_hash,
+                                                  int32_t use_salted_seeds,
+                                                  uint32_t salted_dim_a,
+                                                  uint32_t salted_dim_b,
                                                   int device_id,
                                                   void* stream_void) {
   cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
@@ -319,6 +322,7 @@ PEARL_CAPI_EXPORT int pearl_capi_commitment_hash_from_merkle_roots(
   try {
     commitment_hash_from_merkle_roots(A_merkle_root, B_merkle_root, key,
                                       A_commitment_hash, B_commitment_hash,
+                                      use_salted_seeds != 0, salted_dim_a, salted_dim_b,
                                       *dprops, stream);
   } catch (const std::exception&) {
     return -2;
@@ -667,6 +671,7 @@ PEARL_CAPI_EXPORT int pearl_capi_install_B(
     return -1;
   }
   if (p->expand_bseed && !p->bseed) return -1;
+  if (p->use_salted_seeds && (p->m <= 0 || p->n <= 0)) return -12;
 
   cudaStream_t stream = static_cast<cudaStream_t>(stream_void);
   cudaDeviceProp* dprops = get_dprops_locked(p->device_id);
@@ -746,6 +751,7 @@ PEARL_CAPI_EXPORT int pearl_capi_install_B(
       static_cast<const uint8_t*>(p->Key),
       static_cast<uint8_t*>(p->CommitA),
       static_cast<uint8_t*>(p->CommitB),
+      p->use_salted_seeds, static_cast<uint32_t>(p->m), static_cast<uint32_t>(p->n),
       p->device_id,
       stream_void);
   if (rc != 0) return rc;
@@ -1125,6 +1131,7 @@ PEARL_CAPI_EXPORT int pearl_capi_workspace_install_params(
     void* workspace_ptr, const PearlCapiWorkspaceParams* p) {
   if (!workspace_ptr || !p) return -1;
   auto* ws = static_cast<PearlCapiWorkspace*>(workspace_ptr);
+  if (p->use_salted_seeds && (p->m <= 0 || p->n <= 0)) return -2;
 
   destroy_iter_graph(ws);
   ws->params = *p;
@@ -1222,6 +1229,7 @@ PEARL_CAPI_EXPORT int pearl_capi_iter(void*    workspace_ptr,
       static_cast<const uint8_t*>(p.Key),
       static_cast<uint8_t*>(p.CommitA),
       static_cast<uint8_t*>(p.CommitB),
+      p.use_salted_seeds, static_cast<uint32_t>(p.m), static_cast<uint32_t>(p.n),
       device_id, stream_void);
   if (rc != 0) return fail(rc);
   if (events_ok) (void)cudaEventRecord(ev[3], stream);
@@ -1412,6 +1420,7 @@ PEARL_CAPI_EXPORT int pearl_capi_iter_batch_graph_prepare(
         static_cast<const uint8_t*>(p.Key),
         static_cast<uint8_t*>(p.CommitA),
         static_cast<uint8_t*>(p.CommitB),
+        p.use_salted_seeds, static_cast<uint32_t>(p.m), static_cast<uint32_t>(p.n),
         device_id, stream_void);
     if (rc != 0) {
       abort_capture();

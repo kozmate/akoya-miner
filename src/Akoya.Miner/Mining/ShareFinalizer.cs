@@ -41,6 +41,7 @@ internal sealed record SharePayload(
     int             N,
     int             K,
     int             R,
+    uint            CertVersion,
     uint            ClaimedDifficultyNbits,
     BigInteger      EffectiveTarget,
     Akoya.Crypto.MiningConfiguration MiningConfig,
@@ -154,6 +155,7 @@ internal sealed class ShareFinalizer : IAsyncDisposable
                     n:                      p.N,
                     k:                      p.K,
                     r:                      p.R,
+                    useSaltedSeeds:         p.CertVersion == SigmaContext.CertVersionV3,
                     claimedDifficultyNbits: p.ClaimedDifficultyNbits,
                     timings:                out buildTimings,
                     collectTimings:         RuntimePerfTimings);
@@ -177,6 +179,7 @@ internal sealed class ShareFinalizer : IAsyncDisposable
                     n:                      p.N,
                     k:                      p.K,
                     r:                      p.R,
+                    useSaltedSeeds:         p.CertVersion == SigmaContext.CertVersionV3,
                     claimedDifficultyNbits: p.ClaimedDifficultyNbits,
                     timings:                out buildTimings,
                     collectTimings:         RuntimePerfTimings);

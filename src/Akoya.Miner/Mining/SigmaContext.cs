@@ -12,6 +12,9 @@ internal sealed class SigmaContext
     public const int HeaderSize = 76;
     public const int ConfigSize = 52;
     public const int BSeedSize = 32;
+    public const uint CertVersionV2 = 2;
+    public const uint CertVersionV3 = 3;
+    public const ulong LuckyPoolMainnetSaltedSeedForkHeight = 98_900;
 
     public Guid JobId { get; }
 
@@ -31,6 +34,8 @@ internal sealed class SigmaContext
     public byte[] ConfigBytes { get; }              // 52 B MiningConfiguration.ToBytes()
     public uint CommonDim { get; }                  // = K (miner-chosen)
     public ushort Rank { get; }                     // = R (miner-chosen, default 128)
+    public uint CertVersion { get; }
+    public bool UseSaltedSeeds => CertVersion == CertVersionV3;
     public byte[] JobKey { get; }                   // 32 B BLAKE3 keyed merkle key
     public byte[] BSeed { get; }
 
@@ -83,6 +88,7 @@ internal sealed class SigmaContext
         byte[] configBytes,
         uint commonDim,
         ushort rank,
+        uint certVersion,
         byte[] jobKey,
         byte[] bSeed,
         uint auditK,
@@ -98,6 +104,7 @@ internal sealed class SigmaContext
         ConfigBytes        = configBytes;
         CommonDim          = commonDim;
         Rank               = rank;
+        CertVersion        = certVersion;
         JobKey             = jobKey;
         BSeed              = bSeed;
         AuditK             = auditK;
@@ -235,6 +242,7 @@ internal sealed class SigmaContext
             configBytes:        configBytes,
             commonDim:          commonDim,
             rank:               rank,
+            certVersion:        CertVersionV2,
             jobKey:             jobKey,
             bSeed:              job.BSeed.ToByteArray(),
             auditK:             job.AuditK,
@@ -454,12 +462,15 @@ internal sealed class SigmaContext
                 ? checked((long)job.Height.Value)
                 : 0L;
 
+        var certVersion = ResolveLuckyPoolCertVersion(job);
+
         return new SigmaContext(
             jobId:              internalJobId,
             sigma:              sigma,
             configBytes:        configBytes,
             commonDim:          commonDim,
             rank:               rank,
+            certVersion:        certVersion,
             jobKey:             jobKey,
             bSeed:              bSeed,
 
@@ -490,6 +501,7 @@ internal sealed class SigmaContext
             configBytes:        ConfigBytes,
             commonDim:          CommonDim,
             rank:               Rank,
+            certVersion:        CertVersion,
             jobKey:             JobKey,
             bSeed:              BSeed,
             auditK:             AuditK,
@@ -520,6 +532,7 @@ internal sealed class SigmaContext
             configBytes:        ConfigBytes,
             commonDim:          CommonDim,
             rank:               Rank,
+            certVersion:        CertVersion,
             jobKey:             JobKey,
             bSeed:              BSeed,
             auditK:             AuditK,
@@ -528,6 +541,32 @@ internal sealed class SigmaContext
             blockHeight:        BlockHeight,
             explicitTarget:     newTarget,
             externalJobId:      ExternalJobId);
+    }
+
+    private static uint ResolveLuckyPoolCertVersion(LuckyPoolJob job)
+    {
+        if (job.CertVersion.HasValue)
+        {
+            uint version = job.CertVersion.Value;
+            if (version == 1 || version == CertVersionV2 || version == CertVersionV3)
+                return version;
+
+            throw new InvalidOperationException(
+                $"LuckyPool requires unsupported Pearl certificate version {version}; refusing to guess seed rules.");
+        }
+
+        if (!job.Height.HasValue)
+        {
+            throw new InvalidOperationException(
+                "LuckyPool job supplied neither a certificate version nor a block height; cannot select Pearl seed derivation safely.");
+        }
+
+        // Compatibility fallback for LuckyPool's historical Stratum notify,
+        // which supplied height but no requiredcertversion. This adapter is
+        // for Pearl mainnet; V3 activates at height 98900.
+        return job.Height.Value >= LuckyPoolMainnetSaltedSeedForkHeight
+            ? CertVersionV3
+            : CertVersionV2;
     }
 
     /// <summary>

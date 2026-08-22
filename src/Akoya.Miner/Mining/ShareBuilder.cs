@@ -43,6 +43,7 @@ internal static class ShareBuilder
         int n,
         int k,
         int r,
+        bool useSaltedSeeds,
         uint claimedDifficultyNbits,
         byte[] hashB,
         out Timings timings,
@@ -70,7 +71,7 @@ internal static class ShareBuilder
 
         // 4. Noise seeds, jackpot, claimed_hash.
         stageStart = TimingStart(collectTimings);
-        var (bNoiseSeed, aNoiseSeed) = CommitmentHasher.DeriveNoiseSeeds(jobKey, hashA, hashB);
+        var (bNoiseSeed, aNoiseSeed) = CommitmentHasher.DeriveNoiseSeeds(jobKey, hashA, hashB, m, n, useSaltedSeeds);
 
         var secretA = ParseRows(aSlice, h, k);
         var secretB = ParseRows(bSlice, w, k);
@@ -140,6 +141,7 @@ internal static class ShareBuilder
         int n,
         int k,
         int r,
+        bool useSaltedSeeds,
         uint claimedDifficultyNbits,
         out Timings timings,
         bool collectTimings = true)
@@ -162,7 +164,7 @@ internal static class ShareBuilder
         var hashB = bProof.Root;
 
         stageStart = TimingStart(collectTimings);
-        var (bNoiseSeed, aNoiseSeed) = CommitmentHasher.DeriveNoiseSeeds(jobKey, hashA, hashB);
+        var (bNoiseSeed, aNoiseSeed) = CommitmentHasher.DeriveNoiseSeeds(jobKey, hashA, hashB, m, n, useSaltedSeeds);
 
         var secretA = ParseRows(aSlice, h, k);
         var secretB = ParseRows(bSlice, w, k);
@@ -245,6 +247,7 @@ internal static class ShareBuilder
         int n,
         int k,
         int r,
+        bool useSaltedSeeds,
         uint claimedDifficultyNbits,
         out Timings timings,
         bool collectTimings = true)
@@ -265,7 +268,7 @@ internal static class ShareBuilder
         var hashB = bProof.Root;
 
         stageStart = TimingStart(collectTimings);
-        var (bNoiseSeed, aNoiseSeed) = CommitmentHasher.DeriveNoiseSeeds(jobKey, hashA, hashB);
+        var (bNoiseSeed, aNoiseSeed) = CommitmentHasher.DeriveNoiseSeeds(jobKey, hashA, hashB, m, n, useSaltedSeeds);
 
         var secretA = ParseRows(aSlice, h, k);
         var secretB = ParseRows(bSlice, w, k);
@@ -336,10 +339,11 @@ internal static class ShareBuilder
         int n,
         int k,
         int r,
+        bool useSaltedSeeds,
         uint claimedDifficultyNbits,
         byte[] hashB)
         => Build(sigma, configBytes, jobKey, aBytes, bBytes, aRowIndices, bColIndices,
-                 tileRow, tileCol, m, n, k, r, claimedDifficultyNbits, hashB, out _);
+                 tileRow, tileCol, m, n, k, r, useSaltedSeeds, claimedDifficultyNbits, hashB, out _);
 
     private static ProtoMerkleProof ToProtoMerkleProof(MerkleRootAndProofResult r)
     {

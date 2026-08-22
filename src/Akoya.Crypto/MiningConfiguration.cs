@@ -206,6 +206,25 @@ public static class CommitmentHasher
 {
     public const int KeySize = 32;
 
+    // Certificate V3 domain-separation salts. These are the 32-byte BLAKE3
+    // digests of the protocol context strings, pinned as bytes so consensus
+    // behaviour does not depend on runtime string hashing.
+    private static readonly byte[] SeedSaltA =
+    [
+        0x82, 0x49, 0x40, 0x6C, 0xA0, 0xED, 0x15, 0x16,
+        0x96, 0x16, 0xF6, 0x92, 0xFC, 0xF0, 0x76, 0xF8,
+        0x92, 0xDB, 0xDB, 0x2A, 0x70, 0x23, 0xB8, 0x52,
+        0xF0, 0xD4, 0x77, 0x19, 0xC3, 0x90, 0x01, 0x7B,
+    ];
+
+    private static readonly byte[] SeedSaltB =
+    [
+        0x11, 0x30, 0x06, 0x32, 0xEC, 0x63, 0x01, 0xCA,
+        0x2B, 0xE2, 0xAF, 0x71, 0x8B, 0x3F, 0x4D, 0x4F,
+        0x1A, 0xE9, 0xC6, 0x39, 0x88, 0xE8, 0xCC, 0x04,
+        0x48, 0x44, 0x30, 0x1D, 0x71, 0xB8, 0x9A, 0xA9,
+    ];
+
     /// <summary>
     /// Derive the V2 canonical 32-byte commitment key (jobKey).
     /// <c>key = BLAKE3(incomplete_header_bytes ‖ mining_config.to_bytes())</c>.
@@ -303,25 +322,78 @@ public static class CommitmentHasher
     }
 
     /// <summary>
-    /// Derive chained noise seeds from jobKey and commitment hashes.
-    /// bNoiseSeed = BLAKE3(jobKey ‖ hashB)
-    /// aNoiseSeed = BLAKE3(bNoiseSeed ‖ hashA)
+    /// Legacy V1/V2 seed derivation. Kept as the three-argument overload so
+    /// existing Akoya V2 callers retain byte-for-byte behaviour.
     /// </summary>
     public static (byte[] BNoiseSeed, byte[] ANoiseSeed) DeriveNoiseSeeds(
         ReadOnlySpan<byte> jobKey,
         ReadOnlySpan<byte> hashA,
         ReadOnlySpan<byte> hashB)
+        => DeriveNoiseSeeds(jobKey, hashA, hashB, 0, 0, useSaltedSeeds: false);
+
+    /// <summary>
+    /// Certificate-aware dense seed derivation. For V3, each raw Merkle root
+    /// is first bound to its matrix side and logical dimension:
+    ///
+    /// boundA = BLAKE3_keyed(SEED_SALT_A, hashA || LE32(m) || zero[28])
+    /// boundB = BLAKE3_keyed(SEED_SALT_B, hashB || LE32(n) || zero[28])
+    ///
+    /// The existing seed chain then runs unchanged over the bound roots.
+    /// The caller must still place the RAW hashA/hashB roots in the PlainProof.
+    /// </summary>
+    public static (byte[] BNoiseSeed, byte[] ANoiseSeed) DeriveNoiseSeeds(
+        ReadOnlySpan<byte> jobKey,
+        ReadOnlySpan<byte> hashA,
+        ReadOnlySpan<byte> hashB,
+        int m,
+        int n,
+        bool useSaltedSeeds)
     {
+        if (jobKey.Length != KeySize)
+            throw new ArgumentException($"jobKey must be {KeySize} bytes.", nameof(jobKey));
+        if (hashA.Length != Blake3.DigestSize)
+            throw new ArgumentException($"hashA must be {Blake3.DigestSize} bytes.", nameof(hashA));
+        if (hashB.Length != Blake3.DigestSize)
+            throw new ArgumentException($"hashB must be {Blake3.DigestSize} bytes.", nameof(hashB));
+
+        byte[]? boundA = null;
+        byte[]? boundB = null;
+        ReadOnlySpan<byte> effectiveA = hashA;
+        ReadOnlySpan<byte> effectiveB = hashB;
+
+        if (useSaltedSeeds)
+        {
+            if (m <= 0) throw new ArgumentOutOfRangeException(nameof(m), "V3 salted dimension m must be positive.");
+            if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n), "V3 salted dimension n must be positive.");
+
+            boundA = BindRoot(hashA, checked((uint)m), SeedSaltA);
+            boundB = BindRoot(hashB, checked((uint)n), SeedSaltB);
+            effectiveA = boundA;
+            effectiveB = boundB;
+        }
+
         var bInput = new byte[64];
         jobKey.CopyTo(bInput);
-        hashB.CopyTo(bInput.AsSpan(32));
+        effectiveB.CopyTo(bInput.AsSpan(32));
         var bNoiseSeed = Blake3.Hash(bInput);
 
         var aInput = new byte[64];
         bNoiseSeed.CopyTo(aInput);
-        hashA.CopyTo(aInput.AsSpan(32));
+        effectiveA.CopyTo(aInput.AsSpan(32));
         var aNoiseSeed = Blake3.Hash(aInput);
 
         return (bNoiseSeed, aNoiseSeed);
+    }
+
+    private static byte[] BindRoot(
+        ReadOnlySpan<byte> rawRoot,
+        uint dimension,
+        ReadOnlySpan<byte> salt)
+    {
+        Span<byte> block = stackalloc byte[64];
+        block.Clear();
+        rawRoot.CopyTo(block);
+        BinaryPrimitives.WriteUInt32LittleEndian(block.Slice(32, 4), dimension);
+        return Blake3.KeyedHash(salt, block);
     }
 }

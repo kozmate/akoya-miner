@@ -450,6 +450,15 @@ public sealed class LuckyPoolClient : IAsyncDisposable
                     }
                 }
 
+                // New Pearl templates expose the required certificate version.
+                // LuckyPool historically omitted it, so keep this optional and
+                // let SigmaContext fall back to the mainnet fork height only
+                // when the pool does not provide an explicit value.
+                uint? certVersion =
+                    TryGetOptionalUInt32(parameters, "requiredcertversion") ??
+                    TryGetOptionalUInt32(parameters, "required_cert_version") ??
+                    TryGetOptionalUInt32(parameters, "cert_version");
+
                 // ====================================================
                 // Header validation
                 // ====================================================
@@ -525,7 +534,8 @@ public sealed class LuckyPoolClient : IAsyncDisposable
                         HeaderHex: headerHex,
                         HeaderBytes: headerBytes,
                         TargetHex: normalizedTarget,
-                        TargetBytes: targetBytes);
+                        TargetBytes: targetBytes,
+                        CertVersion: certVersion);
 
                 Volatile.Write(ref _latestJobId, job.JobId);
                 PrintJob(job);
@@ -626,6 +636,23 @@ public sealed class LuckyPoolClient : IAsyncDisposable
         }
     }
 
+
+    private static uint? TryGetOptionalUInt32(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var value))
+            return null;
+
+        if (value.ValueKind == JsonValueKind.Number && value.TryGetUInt32(out var numeric))
+            return numeric;
+
+        if (value.ValueKind == JsonValueKind.String &&
+            uint.TryParse(value.GetString(), out var textNumeric))
+            return textNumeric;
+
+        throw new InvalidDataException(
+            $"Property '{property}' must be an unsigned integer when present.");
+    }
+
     private static string GetRequiredString(
         JsonElement element,
         string property)
@@ -682,6 +709,9 @@ public sealed class LuckyPoolClient : IAsyncDisposable
 
         Console.WriteLine(
             $"target bytes : {job.TargetBytes.Length}");
+
+        Console.WriteLine(
+            $"cert version : {job.CertVersion?.ToString() ?? "not supplied"}");
 
         Console.WriteLine(
             "-----------------------------------");
@@ -745,4 +775,5 @@ public sealed record LuckyPoolJob(
     string HeaderHex,
     byte[] HeaderBytes,
     string TargetHex,
-    byte[] TargetBytes);
+    byte[] TargetBytes,
+    uint? CertVersion = null);

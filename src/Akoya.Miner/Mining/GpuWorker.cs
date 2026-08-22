@@ -257,6 +257,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
         public byte[] InstalledSigma = [];       // 128 B; empty == no σ installed
         public byte[] InstalledJobKey = [];      // 32 B; matches InstalledSigma
         public string? InstalledExternalJobId;       // Stratum job id; null for Akoya V2
+        public uint InstalledCertVersion = SigmaContext.CertVersionV2;
         public byte[] InstalledHashB = [];       // 32 B; keyed-merkle root of bBytes under InstalledJobKey
         public byte[] InstalledBSeed = [];       // 32 B; pool-supplied opaque B seed for the current σ
         public uint   InstalledAuditK;           // audit_proof v1 K parameter (0 = disabled)
@@ -1025,7 +1026,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             TENSOR_HASH_LEAVES, a.Roots.Handle, scratchHalf.DeviceId, scratchHalf.Stream.Handle));
 
         bool expandB = !bs.BUploaded;
-        InstallNativeBProcess(expandB ? ctx.BSeed : null, expandB, a, bs, scratchHalf.DeviceId, scratchHalf.Stream);
+        InstallNativeBProcess(expandB ? ctx.BSeed : null, expandB, ctx.UseSaltedSeeds, a, bs, scratchHalf.DeviceId, scratchHalf.Stream);
         if (expandB)
         {
             bs.BUploaded = true;
@@ -1071,6 +1072,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             var wp = new PearlGemm.PearlGemmNative.WorkspaceParams
             {
                 M = b.M, N = b.N, K = b.K, R = b.R,
+                UseSaltedSeeds = ctx.UseSaltedSeeds ? 1 : 0,
                 BM = BM, BN = BN, BK = BK, CM = CM, CN = CN,
                 ThNumBlocks = NumBlocks((long)b.M * b.K),
                 ThThreads   = TENSOR_HASH_THREADS,
@@ -1157,6 +1159,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             s.InstalledTargetNbits = ctx.TargetNbits;
             s.InstalledEffectiveTarget = effectiveTarget;
             s.InstalledExternalJobId = ctx.ExternalJobId;
+            s.InstalledCertVersion = ctx.CertVersion;
 
             TouchProgress();
             TouchTriggerOrSigma();
@@ -1164,11 +1167,13 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
         }
 
         _log.LogInformation(
-            "worker[{Gpu}]: σ install job={Job} externalJob={ExternalJob} height={H} targetBits={TargetBits} nbits=0x{Nbits:X8} (rotate={Rot}) sigma={SigmaPrefix} jobKey={JobKeyPrefix} bSeed={BSeedPrefix} auditK={AuditK}",
+            "worker[{Gpu}]: σ install job={Job} externalJob={ExternalJob} height={H} cert={Cert} salted={Salted} targetBits={TargetBits} nbits=0x{Nbits:X8} (rotate={Rot}) sigma={SigmaPrefix} jobKey={JobKeyPrefix} bSeed={BSeedPrefix} auditK={AuditK}",
             _gpuIndex,
             ctx.JobId,
             ctx.ExternalJobId ?? "-",
             ctx.BlockHeight,
+            ctx.CertVersion,
+            ctx.UseSaltedSeeds,
             GetBitLength(effectiveTarget),
             ctx.TargetNbits,
             !sameAsInstalled,
@@ -1220,6 +1225,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
         s.InstalledTargetNbits = ctx.TargetNbits;
         s.InstalledEffectiveTarget = effectiveTarget;
         s.InstalledExternalJobId = ctx.ExternalJobId;
+        s.InstalledCertVersion = ctx.CertVersion;
         s.SigmaInstalledAtTimestamp = Stopwatch.GetTimestamp();
 
         TouchProgress();
@@ -1413,6 +1419,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             N:                      b.N,
             K:                      b.K,
             R:                      b.R,
+            CertVersion:            s.InstalledCertVersion,
             ClaimedDifficultyNbits: s.InstalledTargetNbits,
             EffectiveTarget:         s.InstalledEffectiveTarget,
             MiningConfig:           s.MiningConfig,
@@ -1519,6 +1526,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
     private static void InstallNativeBProcess(
         byte[]? bSeed,
         bool expandBSeed,
+        bool useSaltedSeeds,
         WorkerBuffers a,
         ResidentBStateBuffers bState,
         int deviceId,
@@ -1538,6 +1546,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
                     N = bState.N,
                     K = bState.K,
                     R = bState.R,
+                    UseSaltedSeeds = useSaltedSeeds ? 1 : 0,
                     ExpandBSeed = expandBSeed ? 1 : 0,
                     ThNumBlocks = NumBlocks((long)bState.N * bState.K),
                     ThThreads = TENSOR_HASH_THREADS,
@@ -1841,6 +1850,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
                         InstallNativeBProcess(
                             expandB ? currentBSeed : null,
                             expandB,
+                            true,
                             ping.Buffers,
                             bState,
                             ping.DeviceId,
@@ -2356,6 +2366,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             var wp = new PearlGemm.PearlGemmNative.WorkspaceParams
             {
                 M = b.M, N = b.N, K = b.K, R = b.R,
+                UseSaltedSeeds = 1,
                 BM = BM, BN = BN, BK = BK, CM = CM, CN = CN,
                 ThNumBlocks = NumBlocks((long)b.M * b.K),
                 ThThreads = TENSOR_HASH_THREADS,
@@ -2407,6 +2418,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             var wp = new PearlGemm.PearlGemmNative.WorkspaceParams
             {
                 M = b.M, N = b.N, K = b.K, R = b.R,
+                UseSaltedSeeds = 1,
                 BM = BM, BN = BN, BK = BK, CM = CM, CN = CN,
                 ThNumBlocks = NumBlocks((long)b.M * b.K),
                 ThThreads = TENSOR_HASH_THREADS,
@@ -2466,7 +2478,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             TENSOR_HASH_LEAVES, a.Roots.Handle, scratchHalf.DeviceId, scratchHalf.Stream.Handle));
 
         bool expandB = !bState.BUploaded;
-        InstallNativeBProcess(expandB ? bSeed : null, expandB, a, bState, scratchHalf.DeviceId, scratchHalf.Stream);
+        InstallNativeBProcess(expandB ? bSeed : null, expandB, true, a, bState, scratchHalf.DeviceId, scratchHalf.Stream);
         if (expandB)
         {
             bState.BUploaded = true;
@@ -2540,7 +2552,9 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
                 TENSOR_HASH_LEAVES, b.Roots.Handle, half.DeviceId, half.Stream.Handle));
             Check("commit_seed", PearlGemm.PearlGemmNative.CommitmentHashFromMerkleRoots(
                 b.AHash.Handle, b.BHash.Handle, b.Key.Handle,
-                b.CommitA.Handle, b.CommitB.Handle, half.DeviceId, half.Stream.Handle));
+                b.CommitA.Handle, b.CommitB.Handle,
+                1, (uint)b.M, (uint)b.N,
+                half.DeviceId, half.Stream.Handle));
             Check("noise_gen full", PearlGemm.PearlGemmNative.NoiseGen(
                 b.R, b.M, b.N, b.K,
                 b.EAL.Handle, b.EALFp16.Handle,
@@ -2595,6 +2609,7 @@ internal sealed class GpuWorker : IAsyncDisposable, ILivenessTarget
             var wp = new PearlGemm.PearlGemmNative.WorkspaceParams
             {
                 M = b.M, N = b.N, K = b.K, R = b.R,
+                UseSaltedSeeds = 1,
                 BM = BM, BN = BN, BK = BK, CM = CM, CN = CN,
                 ThNumBlocks = NumBlocks((long)b.M * b.K),
                 ThThreads   = TENSOR_HASH_THREADS,

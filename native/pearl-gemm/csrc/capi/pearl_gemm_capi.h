@@ -108,6 +108,9 @@ int pearl_capi_commitment_hash_from_merkle_roots(const uint8_t* A_merkle_root,
                                                  const uint8_t* key,
                                                  uint8_t*       A_commitment_hash,
                                                  uint8_t*       B_commitment_hash,
+                                                 int32_t        use_salted_seeds,
+                                                 uint32_t       salted_dim_a,
+                                                 uint32_t       salted_dim_b,
                                                  int            device_id,
                                                  void*          stream);
 
@@ -152,6 +155,7 @@ int pearl_capi_noise_B(const struct PearlCapiNoiseBParams* p, void* stream);
 //   noise_B(B, EBR, EBL, EAR) -> BpEB/EARxBpEB
 struct PearlCapiInstallBParams {
     int32_t m, n, k, r;
+    int32_t use_salted_seeds;
     int32_t expand_bseed;
     uint32_t th_num_blocks;
     uint32_t th_threads;
@@ -254,6 +258,7 @@ int pearl_capi_workspace_free(void* workspace, void* stream);
 struct PearlCapiWorkspaceParams {
     // Dimensions (constant for σ lifetime).
     int32_t m, n, k, r;
+    int32_t use_salted_seeds;
 
     // Matmul tiling — must match a built kernel instantiation.
     int32_t bM, bN, bK, cM, cN;

@@ -149,7 +149,7 @@ void run_commitment_hash_from_merkle_roots(at::Tensor& A_merkle_root,
   commitment_hash_from_merkle_roots(
       A_merkle_root.data_ptr<uint8_t>(), B_merkle_root.data_ptr<uint8_t>(),
       key.data_ptr<uint8_t>(), A_commitment_hash.data_ptr<uint8_t>(),
-      B_commitment_hash.data_ptr<uint8_t>(), *dprops, stream);
+      B_commitment_hash.data_ptr<uint8_t>(), false, 0, 0, *dprops, stream);
 }
 
 #undef CHECK_DEVICE
